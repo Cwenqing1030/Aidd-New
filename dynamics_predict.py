@@ -6,22 +6,29 @@ import sys
 
 # ================
 # 第一个神经网络 NN1
+# ================
 class NN1(nn.Module):
 
-    def __init__(self, input_dim, hidden_dim, output_dim):
+    def __init__(self, hidden_dim):
         super(NN1, self).__init__()
 
-        self.n2e = nn.Linear(input_dim, hidden_dim)
-        self.e2e = nn.Linear(hidden_dim, output_dim)
+        # 1维节点状态 -> F维隐藏特征
+        self.linear = nn.Linear(
+            1,
+            hidden_dim
+        )
 
     def forward(self, x):
 
-        x = F.relu(self.n2e(x))
-        x = F.relu(self.e2e(x))
+        x = F.relu(
+            self.linear(x)
+        )
 
         return x
 
-# NN2
+# ================
+# 第二个神经网络 NN2
+# ================
 class NN2(nn.Module):
 
     def __init__(self, input_dim, hidden_dim, output_dim):
@@ -37,14 +44,18 @@ class NN2(nn.Module):
 
         return x
 
-
-# NN3
+# ================
+# 第三个神经网络 NN3
+# ================
 class NN3(nn.Module):
 
     def __init__(self, input_dim, output_dim):
         super(NN3, self).__init__()
 
-        self.output = nn.Linear(input_dim, output_dim)
+        self.output = nn.Linear(
+            input_dim,
+            output_dim
+        )
 
     def forward(self, x):
 
@@ -52,168 +63,91 @@ class NN3(nn.Module):
 
         return x
 
-# ======
+# ==========
 # 读取数据
+# ==========
 data = np.load("generated_data.npz")
 
 all_Xt = data["all_Xt"]
 graph_types = data["graph_types"]
 B = data["B"]
 
+# ===============
 # 选择ER网络的数据
+# ===============
 er_mask = (graph_types == "ER")
 Xt_er = all_Xt[er_mask]
 
-# 选择第一张ER网络
-Xt = Xt_er[0]
 
-# 选择目标节点 i
-target_node = 0
-
-# 取B中目标节点i对应的列
-B_column = B[:, target_node]
-
-# 当前测试时间
-t = 0
-# 当前时刻整个网络状态 X^t
-X_t = Xt[t]
-
-# 当前时刻目标节点状态 x_i^t
-x_i_t = Xt[t, target_node]
-
-# 下一时刻目标节点状态 x_i^(t+1)
-target_next = Xt[t + 1, target_node]
-
-# X_t变成1×100
-X_t = X_t.reshape(1, -1)
-
-# x_i_t变成1×1
-x_i_t = np.array([[x_i_t]])
-
-# 构造NN1输入
-nn1_input = np.concatenate(
-    (
-        x_i_t,
-        X_t
-    ),
-    axis=1
-)
-
-# 转换成PyTorch张量
-nn1_input = torch.tensor(
-    nn1_input,
-    dtype=torch.float32
+# =====================
+# 节点信息融合层
+# =====================
+# 输入：[x_i^t, X^t]
+# x_i^t：1×1
+# X^t：1×100
+# 拼接后：1×101
+# 融合后：1×100
+fusion_layer = nn.Linear(
+    101,
+    100
 )
 
 # =========
 # 创建 NN1
 # =========
-# NN1输入维度
-# 当前输入：[x_i^t, X^t]
-# 维度为1×101
-nn1_input_dim = nn1_input.shape[1]
-
-# NN1隐藏层维度
-# 这里先设置为输入维度
-nn1_hidden_dim = nn1_input_dim
-
-# NN1输出维度,暂时保持一致
-nn1_output_dim = nn1_hidden_dim
-
+# 隐藏维度 F
+F_dim = 32
 nn1 = NN1(
-    nn1_input_dim,
-    nn1_hidden_dim,
-    nn1_output_dim
+    F_dim
 )
 
-h1 = nn1(nn1_input)
-h1_neighbor = h1[:,1:]
-
-# 提取B中目标节点i对应的列
-B_column = torch.tensor(
-    B[:, target_node],
-    dtype=torch.float32
-)
-
-# (100,) -> (1,100),保证可以和h1_neighbor相乘
-B_column = B_column.reshape(1,-1)
-
-# 使用邻接矩阵筛选真实邻居
-h1_filtered = h1_neighbor * B_column
-
-# ===========
-# 邻居信息聚合
-# ===========
-
-# 对100个邻居节点的信息求和
-# 得到目标节点i收到的总邻居影响
-neighbor_sum = torch.sum(
-    h1_filtered,
-    dim=1,
-    keepdim=True
-)
 # =========
 # 创建 NN2
 # =========
-
-# NN2输入就是邻居聚合后的结果
-nn2_input_dim = neighbor_sum.shape[1]
-
-# 隐藏维度先保持一致
-nn2_hidden_dim = nn2_input_dim
-
-# 输出维度先保持一致
-nn2_output_dim = nn2_hidden_dim
-
+# NN1最终输出的特征维度为F
+# B筛选以后仍然得到1×F
+# 所以NN2： 1×F -> 1×F
+nn2_input_dim = F_dim
+nn2_hidden_dim = F_dim
+nn2_output_dim = F_dim
 
 nn2 = NN2(
-    nn2_input_dim,
-    nn2_hidden_dim,
-    nn2_output_dim
-)
-
-h2 = nn2(neighbor_sum)
-# =============
-# 构造 NN3 输入
-# =============
-
-# h2 + 当前节点状态 x_i^t
-nn3_input = torch.cat(
-    (
-        h2,
-        torch.tensor(
-            x_i_t,
-            dtype=torch.float32
-        )
-    ),
-    dim=1
+    input_dim=nn2_input_dim,
+    hidden_dim=nn2_hidden_dim,
+    output_dim=nn2_output_dim
 )
 
 # =========
 # 创建 NN3
 # =========
+# NN2输出： h2 = 1×F
+# 当前节点状态： x_i^t = 1×1
+# 拼接以后： 1×(F+1)
 
-nn3_input_dim = nn3_input.shape[1]
+nn3_input_dim = F_dim + 1
 
-# 输出一个状态值
-nn3_output_dim = 1
+# SIR三个类别：
+# 0 -> S
+# 1 -> I
+# 2 -> R
 
+nn3_output_dim = 3
 
 nn3 = NN3(
-    nn3_input_dim,
-    nn3_output_dim
+    input_dim=nn3_input_dim,
+    output_dim=nn3_output_dim
 )
 
-prediction = nn3(nn3_input)
-
-# 定义损失函数F
-criterion = nn.MSELoss()
-
+# ===========
+# 定义损失函数
+# ===========
+criterion = nn.CrossEntropyLoss()
+# ===========
 # 定义优化器
-# 训练NN1、NN2、NN3
-# B不参与训练
+# ===========
 optimizer = torch.optim.Adam(
-    list(nn1.parameters())
+    list(fusion_layer.parameters())
+    + list(nn1.parameters())
     + list(nn2.parameters())
     + list(nn3.parameters()),
     lr=0.01
@@ -224,89 +158,268 @@ optimizer = torch.optim.Adam(
 # ====
 num_epochs = 100
 
-for epoch in range(1, num_epochs + 1):
+# =============
+# 第一层：epoch
+# =============
+for epoch in range(num_epochs):
 
-    # 清空上一轮梯度
-    optimizer.zero_grad()
+    # 用来统计当前epoch的loss
+    epoch_loss = 0.0
 
-    # =================
-    # NN1
-    # =================
+    # 当前epoch一共训练了多少个节点样本
+    sample_count = 0
 
-    # 输入[x_i^t, X^t]，得到h1
-    h1 = nn1(nn1_input)
+    # =============
+    # 第二层：graph
+    # =============
+    # 遍历所有ER网络
+    for graph_idx in range(len(Xt_er)):
+        # 当前ER网络
+        Xt = Xt_er[graph_idx]
 
-    # h1第一列对应目标节点自身信息
-    # 取后100列作为100个节点的信息
-    h1_neighbor = h1[:, 1:]
+        # ============
+        # 第三层：time
+        # ============
+        # Xt共有20个时间点
+        # t=0  -> t=1
+        # t=1  -> t=2
+        # ...
+        # t=18 -> t=19
+        # 这里只遍历到倒数第二个时刻
 
-    # 使用B[:, i]筛选真正的邻居
-    h1_filtered = h1_neighbor * B_column
+        for t in range(Xt.shape[0] - 1):
 
-    neighbor_sum = torch.sum(
-        h1_filtered,
-        dim=1,
-        keepdim=True
+            # 当前时刻整个网络状态 X^t
+            # 原始维度：(100,)
+            X_t = Xt[t]
+
+            # ============
+            # 第四层：node
+            # ============
+            # 遍历当前网络的100个节点
+            for target_node in range(Xt.shape[1]):
+                # 每个节点开始前清空梯度
+                optimizer.zero_grad()
+                # 当前节点状态
+                # 当前时刻目标节点状态 x_i^t
+                x_i_t = Xt[
+                    t,
+                    target_node
+                ]
+
+                # 下一时刻目标节点真实状态 x_i^(t+1)
+                target_next = Xt[
+                    t + 1,
+                    target_node
+                ]
+
+                # =========
+                # 整理 X^t
+                # =========
+                # X_t：
+                # (100,) -> (1,100)
+                X_t_input = X_t.reshape(
+                    1,
+                    -1
+                )
+
+                # =====================
+                # 整理 x_i^t
+                # =====================
+                # 标量 -> 1×1
+                x_i_input = np.array(
+                    [[x_i_t]]
+                )
+
+                # =============
+                # 构造融合层输入
+                # =============
+                # x_i^t： 1×1
+                # X^t：1×100
+                # 拼接：1×101
+                fusion_input = np.concatenate(
+                    (
+                        x_i_input,
+                        X_t_input
+                    ),
+                    axis=1
+                )
+
+                # numpy -> torch
+                fusion_input = torch.tensor(
+                    fusion_input,
+                    dtype=torch.float32
+                )
+
+                # =====================
+                # 当前节点状态转Tensor
+                # =====================
+                # 维度：
+                # 1×1
+                x_i_tensor = torch.tensor(
+                    x_i_input,
+                    dtype=torch.float32
+                )
+
+                # =========
+                # 信息融合
+                # =========
+                # 1×101 -> 1×100
+                nn1_input = fusion_layer(
+                    fusion_input
+                )
+
+                # ===========
+                # NN1输入准备
+                # ===========
+                # 当前：1×100
+                # 转换：100×1
+                nn1_input = nn1_input.T
+
+                # =====
+                # NN1
+                # =====
+                # 输入： 100×1
+                # 输出： 100×32
+                h1 = nn1(
+                    nn1_input
+                )
+
+                # ==================
+                # 取当前节点对应的B列
+                # ==================
+                # 当前节点是 target_node
+                # 取：B[:, target_node]
+                # 原始维度：(100,)
+                B_column = torch.tensor(
+                    B[:, target_node],
+                    dtype=torch.float32
+                )
+
+                # ==========
+                # B列整理维度
+                # ==========
+                # (100,) -> (100,1)
+                B_column = B_column.reshape(
+                    100,
+                    1
+                )
+
+                # (100,1)-> (1,100)
+                B_column = B_column.T
+
+                # =============
+                # B筛选邻居信息
+                # =============
+                # B_column： 1×100
+                # h1：100×32
+                # 矩阵乘法： (1×100)(100×32)
+                # 得到： 1×32
+                neighbor_sum = torch.matmul(
+                    B_column,
+                    h1
+                )
+
+                # ======
+                # NN2
+                # ======
+
+                # 输入：1×32
+                # 输出：1×32
+
+                h2 = nn2(
+                    neighbor_sum
+                )
+
+                # =============
+                # 构造 NN3 输入
+                # =============
+                # h2：1×32
+                # x_i_tensor：1×1
+                # 拼接：1×33
+                nn3_input = torch.cat(
+                    (
+                        h2,
+                        x_i_tensor
+                    ),
+                    dim=1
+                )
+
+                # =========
+                # NN3预测
+                # =========
+                # 输入：1×33
+                # 输出：1×3
+                # 三个logits分别对应：
+                # 0 -> S
+                # 1 -> I
+                # 2 -> R
+                prediction = nn3(
+                    nn3_input
+                )
+
+                # ============
+                # 构造真实标签
+                # ============
+                # target_next：
+                # 0 / 1 / 2
+                # CrossEntropyLoss要求：
+                # dtype = long
+                # shape = [1]
+                target_label = torch.tensor(
+                    [target_next],
+                    dtype=torch.long
+                )
+
+                # ========
+                # 计算损失
+                # ========
+                loss = criterion(
+                    prediction,
+                    target_label
+                )
+
+                # =========
+                # 反向传播
+                # =========
+                # 注意：backward就在node循环里面,当前node算完loss以后立即反向传播
+                loss.backward()
+
+                # =========
+                # 更新参数
+                # =========
+                # 当前node反向传播以后,立即更新参数
+                optimizer.step()
+
+                # ==================
+                # 得到最终SIR预测状态
+                # ==================
+                # 从三个logits中
+                # 取最大值对应的位置
+                # 得到： 0 / 1 / 2
+                state_prediction = torch.argmax(
+                    prediction,
+                    dim=1
+                )
+
+                # =========
+                # 记录loss
+                # =========
+                epoch_loss += loss.item()
+                sample_count += 1
+
+    # ==================
+    # 当前epoch平均loss
+    # ==================
+    average_loss = (
+        epoch_loss
+        / sample_count
     )
 
-    # =================
-    # NN2
-    # =================
-
-    h2 = nn2(neighbor_sum)
-
-    # =================
-    # NN3
-    # =================
-
-    # 当前目标节点状态x_i^t
-    x_i_t_tensor = torch.tensor(
-        x_i_t,
-        dtype=torch.float32
+    # ===========
+    # 打印训练结果
+    # ===========
+    print(
+        f"Epoch {epoch + 1}/{num_epochs}, "
+        f"Average Loss = {average_loss:.6f}"
     )
-
-    # NN3输入：
-    # NN2输出h2 + 当前节点状态x_i^t
-    nn3_input = torch.cat(
-        (
-            h2,
-            x_i_t_tensor
-        ),
-        dim=1
-    )
-
-    # NN3预测下一时刻状态x_i^(t+1)
-    prediction = nn3(nn3_input)
-
-    # =================
-    # 真实值
-    # =================
-
-    target_label = torch.tensor(
-        [[target_next]],
-        dtype=torch.float32
-    )
-
-    # =================
-    # 计算损失
-    # =================
-
-    loss = criterion(
-        prediction,
-        target_label
-    )
-
-    # 反向传播
-    loss.backward()
-
-    # 更新NN1、NN2、NN3参数
-    optimizer.step()
-
-    # 每10轮打印一次
-    if epoch == 1 or epoch % 10 == 0:
-        print(
-            f"Epoch {epoch}/{num_epochs}, "
-            f"Prediction = {prediction.item():.6f}, "
-            f"Target = {target_label.item():.0f}, "
-            f"Loss = {loss.item():.6f}"
-        )
