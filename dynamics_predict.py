@@ -9,16 +9,30 @@ import sys
 # ================
 class NN1(nn.Module):
 
-    def __init__(self, hidden_dim):
+    def __init__(self, hidden_dim,n,d):
         super(NN1, self).__init__()
+
+        self.linear1 = nn.Linear(
+            n+1,
+            n
+        )
 
         # 1维节点状态 -> F维隐藏特征
         self.linear = nn.Linear(
-            1,
+            d,
             hidden_dim
         )
 
+
     def forward(self, x):
+
+        x = x.T
+
+        x = F.relu(
+            self.linear1(x)
+        )
+
+        x=x.T
 
         x = F.relu(
             self.linear(x)
@@ -78,28 +92,16 @@ B = data["B"]
 er_mask = (graph_types == "ER")
 Xt_er = all_Xt[er_mask]
 
-
-# =====================
-# 节点信息融合层
-# =====================
-# 输入：[x_i^t, X^t]
-# x_i^t：1×1
-# X^t：1×100
-# 拼接后：1×101
-# 融合后：1×100
-fusion_layer = nn.Linear(
-    101,
-    100
-)
-
 # =========
-# 创建 NN1
+# 创建 NN1？
 # =========
 # 隐藏维度 F
 F_dim = 32
+n = 100
+d = 1
 nn1 = NN1(
-    F_dim
-)
+    F_dim,n,d
+).cuda()
 
 # =========
 # 创建 NN2
@@ -115,7 +117,7 @@ nn2 = NN2(
     input_dim=nn2_input_dim,
     hidden_dim=nn2_hidden_dim,
     output_dim=nn2_output_dim
-)
+).cuda()
 
 # =========
 # 创建 NN3
@@ -136,7 +138,7 @@ nn3_output_dim = 3
 nn3 = NN3(
     input_dim=nn3_input_dim,
     output_dim=nn3_output_dim
-)
+).cuda()
 
 # ===========
 # 定义损失函数
@@ -146,8 +148,7 @@ criterion = nn.CrossEntropyLoss()
 # 定义优化器
 # ===========
 optimizer = torch.optim.Adam(
-    list(fusion_layer.parameters())
-    + list(nn1.parameters())
+    list(nn1.parameters())
     + list(nn2.parameters())
     + list(nn3.parameters()),
     lr=0.01
@@ -237,7 +238,7 @@ for epoch in range(num_epochs):
                 # x_i^t： 1×1
                 # X^t：1×100
                 # 拼接：1×101
-                fusion_input = np.concatenate(
+                NN1_input = np.concatenate(
                     (
                         x_i_input,
                         X_t_input
@@ -246,10 +247,10 @@ for epoch in range(num_epochs):
                 )
 
                 # numpy -> torch
-                fusion_input = torch.tensor(
-                    fusion_input,
+                nn1_input = torch.tensor(
+                    NN1_input,
                     dtype=torch.float32
-                )
+                ).cuda()
 
                 # =====================
                 # 当前节点状态转Tensor
@@ -259,15 +260,7 @@ for epoch in range(num_epochs):
                 x_i_tensor = torch.tensor(
                     x_i_input,
                     dtype=torch.float32
-                )
-
-                # =========
-                # 信息融合
-                # =========
-                # 1×101 -> 1×100
-                nn1_input = fusion_layer(
-                    fusion_input
-                )
+                ).cuda()
 
                 # ===========
                 # NN1输入准备
@@ -294,7 +287,7 @@ for epoch in range(num_epochs):
                 B_column = torch.tensor(
                     B[:, target_node],
                     dtype=torch.float32
-                )
+                ).cuda()
 
                 # ==========
                 # B列整理维度
@@ -369,7 +362,7 @@ for epoch in range(num_epochs):
                 target_label = torch.tensor(
                     [target_next],
                     dtype=torch.long
-                )
+                ).cuda()
 
                 # ========
                 # 计算损失
