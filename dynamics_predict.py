@@ -2,85 +2,62 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import sys
+
 
 # ================
 # 第一个神经网络 NN1
 # ================
 class NN1(nn.Module):
+    def __init__(self, hidden_dim, n, d):
+        super().__init__()
 
-    def __init__(self, hidden_dim,n,d):
-        super(NN1, self).__init__()
-
-        self.linear1 = nn.Linear(
-            n+1,
-            n
-        )
-
+        self.linear1 = nn.Linear(n + 1, n)
         # 1维节点状态 -> F维隐藏特征
-        self.linear = nn.Linear(
-            d,
-            hidden_dim
-        )
-
+        self.linear = nn.Linear(d, hidden_dim)
 
     def forward(self, x):
-
+        x = F.relu(self.linear1(x))
         x = x.T
-
-        x = F.relu(
-            self.linear1(x)
-        )
-
-        x=x.T
-
-        x = F.relu(
-            self.linear(x)
-        )
+        x = F.relu(self.linear(x))
 
         return x
+
 
 # ================
 # 第二个神经网络 NN2
 # ================
 class NN2(nn.Module):
-
     def __init__(self, input_dim, hidden_dim, output_dim):
-        super(NN2, self).__init__()
+        super().__init__()
 
         self.e2n = nn.Linear(input_dim, hidden_dim)
         self.n2n = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, x):
-
         x = F.relu(self.e2n(x))
         x = F.relu(self.n2n(x))
 
         return x
 
+
 # ================
 # 第三个神经网络 NN3
 # ================
 class NN3(nn.Module):
-
     def __init__(self, input_dim, output_dim):
-        super(NN3, self).__init__()
+        super().__init__()
 
-        self.output = nn.Linear(
-            input_dim,
-            output_dim
-        )
+        self.output = nn.Linear(input_dim, output_dim)
 
     def forward(self, x):
-
         x = self.output(x)
-
         return x
+
 
 # ==========
 # 读取数据
 # ==========
-data = np.load("generated_data.npz")
+data = np.load("data/generated_data.npz")
 
 all_Xt = data["all_Xt"]
 graph_types = data["graph_types"]
@@ -89,7 +66,7 @@ B = data["B"]
 # ===============
 # 选择ER网络的数据
 # ===============
-er_mask = (graph_types == "ER")
+er_mask = graph_types == "ER"
 Xt_er = all_Xt[er_mask]
 
 # =========
@@ -99,9 +76,7 @@ Xt_er = all_Xt[er_mask]
 F_dim = 32
 n = 100
 d = 1
-nn1 = NN1(
-    F_dim,n,d
-).cuda()
+nn1 = NN1(F_dim, n, d).cuda()
 
 # =========
 # 创建 NN2
@@ -114,9 +89,7 @@ nn2_hidden_dim = F_dim
 nn2_output_dim = F_dim
 
 nn2 = NN2(
-    input_dim=nn2_input_dim,
-    hidden_dim=nn2_hidden_dim,
-    output_dim=nn2_output_dim
+    input_dim=nn2_input_dim, hidden_dim=nn2_hidden_dim, output_dim=nn2_output_dim
 ).cuda()
 
 # =========
@@ -125,7 +98,6 @@ nn2 = NN2(
 # NN2输出： h2 = 1×F
 # 当前节点状态： x_i^t = 1×1
 # 拼接以后： 1×(F+1)
-
 nn3_input_dim = F_dim + 1
 
 # SIR三个类别：
@@ -134,11 +106,7 @@ nn3_input_dim = F_dim + 1
 # 2 -> R
 
 nn3_output_dim = 3
-
-nn3 = NN3(
-    input_dim=nn3_input_dim,
-    output_dim=nn3_output_dim
-).cuda()
+nn3 = NN3(input_dim=nn3_input_dim, output_dim=nn3_output_dim).cuda()
 
 # ===========
 # 定义损失函数
@@ -148,10 +116,8 @@ criterion = nn.CrossEntropyLoss()
 # 定义优化器
 # ===========
 optimizer = torch.optim.Adam(
-    list(nn1.parameters())
-    + list(nn2.parameters())
-    + list(nn3.parameters()),
-    lr=0.01
+    list(nn1.parameters()) + list(nn2.parameters()) + list(nn3.parameters()),
+    lr=0.01,
 )
 
 # ====
@@ -163,7 +129,6 @@ num_epochs = 100
 # 第一层：epoch
 # =============
 for epoch in range(num_epochs):
-
     # 用来统计当前epoch的loss
     epoch_loss = 0.0
 
@@ -189,7 +154,6 @@ for epoch in range(num_epochs):
         # 这里只遍历到倒数第二个时刻
 
         for t in range(Xt.shape[0] - 1):
-
             # 当前时刻整个网络状态 X^t
             # 原始维度：(100,)
             X_t = Xt[t]
@@ -203,34 +167,23 @@ for epoch in range(num_epochs):
                 optimizer.zero_grad()
                 # 当前节点状态
                 # 当前时刻目标节点状态 x_i^t
-                x_i_t = Xt[
-                    t,
-                    target_node
-                ]
+                x_i_t = Xt[t, target_node]
 
                 # 下一时刻目标节点真实状态 x_i^(t+1)
-                target_next = Xt[
-                    t + 1,
-                    target_node
-                ]
+                target_next = Xt[t + 1, target_node]
 
                 # =========
                 # 整理 X^t
                 # =========
                 # X_t：
                 # (100,) -> (1,100)
-                X_t_input = X_t.reshape(
-                    1,
-                    -1
-                )
+                X_t_input = X_t.reshape(1, -1)
 
                 # =====================
                 # 整理 x_i^t
                 # =====================
                 # 标量 -> 1×1
-                x_i_input = np.array(
-                    [[x_i_t]]
-                )
+                x_i_input = np.array([[x_i_t]])
 
                 # =============
                 # 构造融合层输入
@@ -238,45 +191,24 @@ for epoch in range(num_epochs):
                 # x_i^t： 1×1
                 # X^t：1×100
                 # 拼接：1×101
-                NN1_input = np.concatenate(
-                    (
-                        x_i_input,
-                        X_t_input
-                    ),
-                    axis=1
-                )
+                NN1_input = np.concatenate((x_i_input, X_t_input), axis=1)
 
                 # numpy -> torch
-                nn1_input = torch.tensor(
-                    NN1_input,
-                    dtype=torch.float32
-                ).cuda()
+                nn1_input = torch.tensor(NN1_input, dtype=torch.float32).cuda()
 
                 # =====================
                 # 当前节点状态转Tensor
                 # =====================
                 # 维度：
                 # 1×1
-                x_i_tensor = torch.tensor(
-                    x_i_input,
-                    dtype=torch.float32
-                ).cuda()
-
-                # ===========
-                # NN1输入准备
-                # ===========
-                # 当前：1×100
-                # 转换：100×1
-                nn1_input = nn1_input.T
+                x_i_tensor = torch.tensor(x_i_input, dtype=torch.float32).cuda()
 
                 # =====
                 # NN1
                 # =====
                 # 输入： 100×1
                 # 输出： 100×32
-                h1 = nn1(
-                    nn1_input
-                )
+                h1 = nn1(nn1_input)
 
                 # ==================
                 # 取当前节点对应的B列
@@ -284,19 +216,13 @@ for epoch in range(num_epochs):
                 # 当前节点是 target_node
                 # 取：B[:, target_node]
                 # 原始维度：(100,)
-                B_column = torch.tensor(
-                    B[:, target_node],
-                    dtype=torch.float32
-                ).cuda()
+                B_column = torch.tensor(B[:, target_node], dtype=torch.float32).cuda()
 
                 # ==========
                 # B列整理维度
                 # ==========
                 # (100,) -> (100,1)
-                B_column = B_column.reshape(
-                    100,
-                    1
-                )
+                B_column = B_column.reshape(100, 1)
 
                 # (100,1)-> (1,100)
                 B_column = B_column.T
@@ -308,10 +234,7 @@ for epoch in range(num_epochs):
                 # h1：100×32
                 # 矩阵乘法： (1×100)(100×32)
                 # 得到： 1×32
-                neighbor_sum = torch.matmul(
-                    B_column,
-                    h1
-                )
+                neighbor_sum = torch.matmul(B_column, h1)
 
                 # ======
                 # NN2
@@ -320,9 +243,7 @@ for epoch in range(num_epochs):
                 # 输入：1×32
                 # 输出：1×32
 
-                h2 = nn2(
-                    neighbor_sum
-                )
+                h2 = nn2(neighbor_sum)
 
                 # =============
                 # 构造 NN3 输入
@@ -330,13 +251,7 @@ for epoch in range(num_epochs):
                 # h2：1×32
                 # x_i_tensor：1×1
                 # 拼接：1×33
-                nn3_input = torch.cat(
-                    (
-                        h2,
-                        x_i_tensor
-                    ),
-                    dim=1
-                )
+                nn3_input = torch.cat((h2, x_i_tensor), dim=1)
 
                 # =========
                 # NN3预测
@@ -347,9 +262,7 @@ for epoch in range(num_epochs):
                 # 0 -> S
                 # 1 -> I
                 # 2 -> R
-                prediction = nn3(
-                    nn3_input
-                )
+                prediction = nn3(nn3_input)
 
                 # ============
                 # 构造真实标签
@@ -359,18 +272,12 @@ for epoch in range(num_epochs):
                 # CrossEntropyLoss要求：
                 # dtype = long
                 # shape = [1]
-                target_label = torch.tensor(
-                    [target_next],
-                    dtype=torch.long
-                ).cuda()
+                target_label = torch.tensor([target_next], dtype=torch.long).cuda()
 
                 # ========
                 # 计算损失
                 # ========
-                loss = criterion(
-                    prediction,
-                    target_label
-                )
+                loss = criterion(prediction, target_label)
 
                 # =========
                 # 反向传播
@@ -390,10 +297,7 @@ for epoch in range(num_epochs):
                 # 从三个logits中
                 # 取最大值对应的位置
                 # 得到： 0 / 1 / 2
-                state_prediction = torch.argmax(
-                    prediction,
-                    dim=1
-                )
+                state_prediction = torch.argmax(prediction, dim=1)
 
                 # =========
                 # 记录loss
@@ -404,15 +308,9 @@ for epoch in range(num_epochs):
     # ==================
     # 当前epoch平均loss
     # ==================
-    average_loss = (
-        epoch_loss
-        / sample_count
-    )
+    average_loss = epoch_loss / sample_count
 
     # ===========
     # 打印训练结果
     # ===========
-    print(
-        f"Epoch {epoch + 1}/{num_epochs}, "
-        f"Average Loss = {average_loss:.6f}"
-    )
+    print(f"Epoch {epoch + 1}/{num_epochs}, Average Loss = {average_loss:.6f}")
