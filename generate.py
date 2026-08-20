@@ -1,3 +1,5 @@
+import os
+
 import networkx as nx
 import numpy as np
 
@@ -80,9 +82,8 @@ for network_type, network_num in network_plan:
                 if current_state[node] == S:
                     infected_count = 0
                     for neighbor in range(NUM_NODES):
-                        if A[node, neighbor] == 1:
-                            if current_state[neighbor] == I:
-                                infected_count += 1
+                        if A[node, neighbor] == 1 and current_state[neighbor] == I:
+                            infected_count += 1
                     infection_prob = 1 - ((1 - BETA) ** infected_count)
 
                     if np.random.rand() < infection_prob:
@@ -146,6 +147,9 @@ print(B)
 all_A_array = np.stack(all_A)
 all_Xt_array = np.stack(all_Xt)
 graph_types_array = np.array(graph_types)
+
+if not os.path.exists("data"):
+    os.makedirs("data")
 
 np.savez_compressed(
     "data/generated_data.npz",
