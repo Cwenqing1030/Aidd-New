@@ -1,5 +1,6 @@
-import numpy as np
 import networkx as nx
+import numpy as np
+
 # =======
 # 实验配置
 # =======
@@ -33,11 +34,7 @@ P_B = 0.3
 np.random.seed(SIR_SEED)
 graph_seed = GRAPH_SEED
 
-network_plan = [
-    ("ER", NUM_ER),
-    ("WS", NUM_WS),
-    ("BA", NUM_BA)
-]
+network_plan = [("ER", NUM_ER), ("WS", NUM_WS), ("BA", NUM_BA)]
 
 all_A = []
 all_Xt = []
@@ -48,34 +45,17 @@ I = 1
 R = 2
 
 for network_type, network_num in network_plan:
-
     for i in range(network_num):
-
         if network_type == "ER":
-
             G = nx.erdos_renyi_graph(
-                n=NUM_NODES,
-                p=P_ER,
-                seed=graph_seed,
-                directed=False
+                n=NUM_NODES, p=P_ER, seed=graph_seed, directed=False
             )
 
         elif network_type == "WS":
-
-            G = nx.watts_strogatz_graph(
-                n=NUM_NODES,
-                k=K_WS,
-                p=P_WS,
-                seed=graph_seed
-            )
+            G = nx.watts_strogatz_graph(n=NUM_NODES, k=K_WS, p=P_WS, seed=graph_seed)
 
         elif network_type == "BA":
-
-            G = nx.barabasi_albert_graph(
-                n=NUM_NODES,
-                m=M_BA,
-                seed=graph_seed
-            )
+            G = nx.barabasi_albert_graph(n=NUM_NODES, m=M_BA, seed=graph_seed)
 
         else:
             raise ValueError(f"未知的网络类型: {network_type}")
@@ -103,7 +83,7 @@ for network_type, network_num in network_plan:
                         if A[node, neighbor] == 1:
                             if current_state[neighbor] == I:
                                 infected_count += 1
-                    infection_prob =1-((1-BETA) ** infected_count)
+                    infection_prob = 1 - ((1 - BETA) ** infected_count)
 
                     if np.random.rand() < infection_prob:
                         next_state[node] = I
@@ -145,8 +125,7 @@ structure_rng = np.random.default_rng(structure_seed)
 p_structure = P_B
 
 B_upper = np.triu(
-    (structure_rng.random((NUM_NODES, NUM_NODES)) < p_structure).astype(int),
-    k=1
+    (structure_rng.random((NUM_NODES, NUM_NODES)) < p_structure).astype(int), k=1
 )
 
 B = B_upper + B_upper.T
@@ -169,11 +148,11 @@ all_Xt_array = np.stack(all_Xt)
 graph_types_array = np.array(graph_types)
 
 np.savez_compressed(
-    "generated_data.npz",
+    "data/generated_data.npz",
     all_A=all_A_array,
     all_Xt=all_Xt_array,
     graph_types=graph_types_array,
-    B=B
+    B=B,
 )
 
 print()
