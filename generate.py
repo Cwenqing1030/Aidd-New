@@ -1,5 +1,3 @@
-import os
-
 import networkx as nx
 import numpy as np
 
@@ -12,7 +10,8 @@ GRAPH_SEED = 2000
 B_SEED = 3000
 
 NUM_NODES = 100
-NUM_STEPS = 20
+NUM_STEPS = 1000
+RESET_INTERVAL = 100
 
 NUM_GRAPHS = 50
 
@@ -76,14 +75,26 @@ for network_type, network_num in network_plan:
 
         # 当前这一张网络进行SIR时间迭代
         for t in range(NUM_STEPS - 1):
+
+            # 每100个时间步重新初始化一次节点状态
+            if (t + 1) % RESET_INTERVAL == 0:
+                next_state = np.zeros(NUM_NODES, dtype=np.int64)
+                next_state[0] = I
+                Xt[t + 1] = next_state
+                continue
+
             current_state = Xt[t]
             next_state = current_state.copy()
+
             for node in range(NUM_NODES):
                 if current_state[node] == S:
                     infected_count = 0
+
                     for neighbor in range(NUM_NODES):
-                        if A[node, neighbor] == 1 and current_state[neighbor] == I:
-                            infected_count += 1
+                        if A[node, neighbor] == 1:
+                            if current_state[neighbor] == I:
+                                infected_count += 1
+
                     infection_prob = 1 - ((1 - BETA) ** infected_count)
 
                     if np.random.rand() < infection_prob:
@@ -95,7 +106,7 @@ for network_type, network_num in network_plan:
 
             Xt[t + 1] = next_state
 
-        # 当前这一张网络的20个时刻全部生成完
+        # 当前这一张网络的1000个时刻全部生成完
         # 再保存整张图的数据
         all_A.append(A.copy())
         all_Xt.append(Xt.copy())
@@ -112,8 +123,8 @@ for network_type, network_num in network_plan:
 
         print("时间状态序列 Xt：")
 
-        for t in range(NUM_STEPS):
-            print(f"t={t}时刻的网络状态：", Xt[t])
+        for t in range(RESET_INTERVAL // 2,NUM_STEPS,RESET_INTERVAL):
+            print(f"t={t}时刻的网络状态：",Xt[t])
 
 
 # ==========================
@@ -147,9 +158,6 @@ print(B)
 all_A_array = np.stack(all_A)
 all_Xt_array = np.stack(all_Xt)
 graph_types_array = np.array(graph_types)
-
-if not os.path.exists("data"):
-    os.makedirs("data")
 
 np.savez_compressed(
     "data/generated_data.npz",
