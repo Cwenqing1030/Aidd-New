@@ -1,3 +1,6 @@
+import argparse
+from pathlib import Path
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -15,18 +18,26 @@ from sklearn.metrics import (
 # ================
 # 第一个神经网络 NN1
 # ================
+# AIDD pairwise message passing：
+# h_ij^(1) = NN^(1)([x_j^t, x_i^t])
+# i = target node，j = source node
+# 每条候选消息只看 (x_j, x_i)，NN1 在所有节点对之间共享
+# 输入 [B,target,source,2]  ->  输出 [B,target,source,F]
+#   dim0 B      = batch（同一时刻的多个时间样本）
+#   dim1 target = 目标节点 i
+#   dim2 source = 候选邻居节点 j
+#   dim3        = 2（[x_j, x_i]）或 F（32维消息特征）
 class NN1(nn.Module):
-    def __init__(self, hidden_dim, n, d):
+    def __init__(self, input_dim, hidden_dim):
         super().__init__()
 
-        self.linear1 = nn.Linear(n + 1, n)
-        # 1维节点状态 -> F维隐藏特征
-        self.linear = nn.Linear(d, hidden_dim)
+        # 输入维度固定为2（[x_j, x_i]），与节点数n无关
+        self.linear1 = nn.Linear(input_dim, hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
 
     def forward(self, x):
         x = F.relu(self.linear1(x))
-        x = x.T
-        x = F.relu(self.linear(x))
+        x = F.relu(self.linear2(x))
 
         return x
 
@@ -34,6 +45,7 @@ class NN1(nn.Module):
 # ================
 # 第二个神经网络 NN2
 # ================
+# 输入 [B,target,F]（邻居聚合后的消息和）  ->  输出 [B,target,F]
 class NN2(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
         super().__init__()
@@ -51,6 +63,7 @@ class NN2(nn.Module):
 # ================
 # 第三个神经网络 NN3
 # ================
+# 输入 [B,target,F+1]（[h2, x_i]）  ->  输出 [B,target,3]（0=S,1=I,2=R 的logits）
 class NN3(nn.Module):
     def __init__(self, input_dim, output_dim):
         super().__init__()
@@ -65,30 +78,172 @@ class NN3(nn.Module):
 # ==========
 # 读取数据
 # ==========
-data = np.load("data/generated_data.npz")
-all_Xt = data["all_Xt"]
-all_A = data["all_A"]
-graph_types = data["graph_types"]
+def load_cond_data(data_dir, dynamics_type):
+    data_dir = Path(data_dir)
+    if not data_dir.exists() and data_dir == Path("CoND-main/data/BA_N200_m2"):
+        data_dir = Path("data/BA_N200_m2")
+
+    network_name = data_dir.name
+    edge_or_adjacency = np.loadtxt(data_dir / f"{network_name}.txt", dtype=np.int64)
+    Xt = np.loadtxt(
+        data_dir / f"{network_name}_{dynamics_type}_x.txt", dtype=np.float32
+    )
+    Yt = np.loadtxt(
+        data_dir / f"{network_name}_{dynamics_type}_y.txt", dtype=np.float32
+    ).astype(np.int64)
+
+    n = Xt.shape[1]
+    if edge_or_adjacency.shape == (n, n):
+        A_true = edge_or_adjacency
+    else:
+        A_true = np.zeros((n, n), dtype=np.int64)
+        source = edge_or_adjacency[:, 0]
+        target = edge_or_adjacency[:, 1]
+        A_true[source, target] = 1
+        A_true[target, source] = 1
+
+    if Yt.shape != Xt.shape:
+        raise ValueError(f"x/y shape mismatch: {Xt.shape} and {Yt.shape}")
+
+    return Xt, Yt, A_true
+
+
+# ================================
+# 无向 Gumbel-Softmax 邻接采样
+# ================================
+# edge_logits: [num_upper, 2]
+#   dim0 = num_upper = n*(n-1)/2（每条唯一无向候选边 i<j 只维护一份参数）
+#   dim1 = 2 个类别：
+#     edge_logits[:, 0] = no-edge logit
+#     edge_logits[:, 1] = edge logit
+#
+# 返回：
+#   A_sampled             [N,N]     采样后的对称邻接矩阵（训练用）
+#   sampled_edge_gate     [num_upper] 采样后的边门控（soft时为[0,1]实数，hard时为0/1）
+#   edge_prob             [num_upper] 确定性边概率（softmax[:, 1]，用于稀疏正则与日志）
+#   edge_sample_two_class [num_upper,2] 完整二分类Gumbel-Softmax样本
+#
+# 要求：
+#   每条无向边只采样一次；上下三角使用同一个采样结果；
+#   A_sampled 严格对称；对角线严格为零；
+#   Gumbel-Softmax 的梯度回传到 edge_logits。
+def sample_gumbel_adjacency(edge_logits, tri_i, tri_j, n, device, temperature, hard):
+    # 1. 确定性边概率（期望）：softmax 的第二个分量 = 边的概率
+    edge_prob = torch.softmax(edge_logits, dim=-1)[:, 1]  # [num_upper]
+
+    # 2. 二分类 Gumbel-Softmax 采样（训练路径，可导）
+    edge_sample_two_class = F.gumbel_softmax(
+        edge_logits,
+        tau=temperature,
+        hard=hard,
+        dim=-1,
+    )  # [num_upper, 2]
+
+    # 3. 取出"是边"的分量作为门控
+    sampled_edge_gate = edge_sample_two_class[:, 1]  # [num_upper]
+
+    # 4. 同一个采样结果镜像填充上下三角，对角线恒为0
+    #    out-of-place index_put，保证梯度能经两个方向都回到 edge_logits
+    A_sampled = torch.zeros(n, n, device=device)
+    A_sampled = A_sampled.index_put((tri_i, tri_j), sampled_edge_gate)
+    A_sampled = A_sampled.index_put((tri_j, tri_i), sampled_edge_gate)
+
+    return A_sampled, sampled_edge_gate, edge_prob, edge_sample_two_class
+
+
+# ================================
+# 结构恢复评价（确定性edge_prob vs A_true，严格上三角）
+# ================================
+# 注意：这里不是验证集——A_true是整张网络的真实结构，
+# 动力学数据全部来自同一张网络并全部参与训练。
+# 衡量的是"学到的结构 vs 真实结构"的吻合度。
+def evaluate_structure(edge_prob, A_true_np, threshold, tri_i, tri_j, n):
+    with torch.no_grad():
+        A_hat = torch.zeros(n, n, device=edge_prob.device)
+        A_hat[tri_i, tri_j] = edge_prob
+        A_hat[tri_j, tri_i] = edge_prob
+        A_rec = (A_hat >= threshold).float()
+        A_hat_np = A_hat.cpu().numpy()
+        A_rec_np = A_rec.cpu().numpy().astype(np.int64)
+
+    upper = np.triu_indices(n, k=1)
+    A_true_eval = A_true_np[upper]
+    A_hat_eval = A_hat_np[upper]
+    A_rec_eval = A_rec_np[upper]
+
+    roc_auc = roc_auc_score(A_true_eval, A_hat_eval)
+    pr_auc = average_precision_score(A_true_eval, A_hat_eval)
+    precision = precision_score(A_true_eval, A_rec_eval, zero_division=0)
+    recall = recall_score(A_true_eval, A_rec_eval, zero_division=0)
+    f1 = f1_score(A_true_eval, A_rec_eval, zero_division=0)
+    accuracy = accuracy_score(A_true_eval, A_rec_eval)
+    shd = int(np.sum(A_true_eval != A_rec_eval))
+
+    return roc_auc, pr_auc, precision, recall, f1, accuracy, shd
+
+
+# ================================
+# 一次性 shape trace（--trace_shapes）
+# 调试用，训练时暂时注释掉；需要时取消注释并加 --trace_shapes
+# ================================
+# def trace_tensor(name, tensor, max_values=6):
+#     req = tensor.requires_grad
+#     t = tensor.detach()
+#     flat = t.reshape(-1)
+#     vals = flat[:max_values].tolist()
+#
+#     if t.numel() > 0:
+#         mn, mx = t.min().item(), t.max().item()
+#         if t.dtype.is_floating_point:
+#             mean = t.mean().item()
+#         else:
+#             mean = t.float().mean().item()
+#     else:
+#         mn = mx = mean = float("nan")
+#
+#     if t.dtype.is_floating_point:
+#         vstr = ", ".join(f"{v:.4f}" for v in vals)
+#     else:
+#         vstr = ", ".join(str(int(v)) for v in vals)
+#
+#     print(
+#         f"[trace] {name} | shape={tuple(t.shape)} dtype={t.dtype} "
+#         f"device={t.device} requires_grad={req} "
+#         f"min={mn:.4f} max={mx:.4f} mean={mean:.4f} | first={vstr}"
+#     )
 
 
 # ===============
-# 选择ER网络的数据
+# CoND数据路径参数
 # ===============
-er_mask = graph_types == "ER"
-Xt_er = all_Xt[er_mask]
-A_er = all_A[er_mask]
+parser = argparse.ArgumentParser()
+parser.add_argument("--data_dir", default="CoND-main/data/BA_N200_m2")
+parser.add_argument("--dynamics_type", default="SIR")
+parser.add_argument("--batch_size", type=int, default=8)
+parser.add_argument("--lambda_sparse", type=float, default=0.01)
+parser.add_argument("--init_edge_prob", type=float, default=0.05)
+parser.add_argument("--lr_dyn", type=float, default=0.001)
+parser.add_argument("--lr_adj", type=float, default=0.004)
+parser.add_argument("--threshold", type=float, default=0.5)
+parser.add_argument("--tau_start", type=float, default=1.0)
+parser.add_argument("--tau_end", type=float, default=0.5)
+parser.add_argument("--gumbel_hard", action="store_true", default=False)
+parser.add_argument("--trace_shapes", action="store_true", default=False)
+parser.add_argument("--seed", type=int, default=42)
+args = parser.parse_args()
+
+np.random.seed(args.seed)
+torch.manual_seed(args.seed)
 
 
 # ===================
-# 选择一个ER网络
+# 读取CoND网络和动力学样本
 # ===================
-graph_idx = 0
-# 当前ER网络状态序列
-Xt = Xt_er[graph_idx]
-# 当前ER网络真实邻接矩阵
-A_true = A_er[graph_idx]
+Xt, Yt, A_true = load_cond_data(args.data_dir, args.dynamics_type)
+# A_true只在训练结束后的结构恢复评价中使用
 print("==============================")
-print(f"开始恢复 ER 网络 {graph_idx}")
+print(f"开始恢复 CoND 网络 {Path(args.data_dir).name} ({args.dynamics_type})")
+print(f"数据形状: x={Xt.shape}, y={Yt.shape}, A_true={A_true.shape}")
 print("==============================")
 
 
@@ -97,25 +252,49 @@ print("==============================")
 # =========
 # 隐藏维度 F
 F_dim = 32
-n = 100
-d = 1
-nn1 = NN1(F_dim, n, d).cuda()
+n = Xt.shape[1]
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# 输入为节点对拼接 [x_j, x_i]，维度2与n无关
+nn1 = NN1(input_dim=2, hidden_dim=F_dim).to(device)
 
 
-# ===================
-# 创建可训练邻接矩阵
-# ===================
-theta = nn.Parameter(torch.randn(n,n).cuda())
+# ==================================
+# 创建无向结构参数（二分类 logits，严格上三角）
+# ==================================
+# 每条唯一无向候选边 i<j 维护 2 个 logits：
+#   edge_logits[:, 0] = no-edge logit
+#   edge_logits[:, 1] = edge logit
+# 初始化保证 softmax(edge_logits, dim=-1)[:, 1] == init_edge_prob
+num_upper = n * (n - 1) // 2
+if not (0.0 < args.init_edge_prob < 1.0):
+    raise ValueError(f"--init_edge_prob 必须在 (0,1) 内，当前为 {args.init_edge_prob}")
 
-# 不允许节点自连接
-identity_mask = 1.0 - torch.eye(n,device=theta.device)
+p = args.init_edge_prob
+no_edge_logit = float(np.log(1.0 - p))
+edge_logit = float(np.log(p))
+init_logits = (
+    torch.tensor([no_edge_logit, edge_logit], device=device)
+    .reshape(1, 2)
+    .repeat(num_upper, 1)
+)
+edge_logits = nn.Parameter(init_logits)  # [num_upper, 2]
+
+with torch.no_grad():
+    init_check = torch.softmax(edge_logits, dim=-1)[:, 1].mean().item()
+print(
+    f"结构参数初始化: edge_logits={tuple(edge_logits.shape)}, "
+    f"softmax(edge_logits)[:,1].mean()={init_check:.6f} (应≈{args.init_edge_prob})"
+)
+
+# 上三角索引缓存（i < j）
+tri_i, tri_j = torch.triu_indices(n, n, offset=1, device=device)
 
 
 # =========
 # 创建 NN2
 # =========
 # NN1最终输出的特征维度为F
-# A_hat筛选以后仍然得到1×F
+# A_sampled筛选以后仍然得到1×F
 # 所以NN2：1×F -> 1×F
 nn2_input_dim = F_dim
 nn2_hidden_dim = F_dim
@@ -123,7 +302,7 @@ nn2_output_dim = F_dim
 
 nn2 = NN2(
     input_dim=nn2_input_dim, hidden_dim=nn2_hidden_dim, output_dim=nn2_output_dim
-).cuda()
+).to(device)
 
 
 # =========
@@ -140,7 +319,7 @@ nn3_input_dim = F_dim + 1
 # 2 -> R
 nn3_output_dim = 3
 
-nn3 = NN3(input_dim=nn3_input_dim, output_dim=nn3_output_dim).cuda()
+nn3 = NN3(input_dim=nn3_input_dim, output_dim=nn3_output_dim).to(device)
 
 
 # ===========
@@ -150,280 +329,264 @@ criterion = nn.CrossEntropyLoss()
 
 
 # ===========
-# 定义优化器
+# 定义优化器（动力学网络与结构参数分开的学习率）
 # ===========
 optimizer = torch.optim.Adam(
-    list(nn1.parameters()) + list(nn2.parameters()) + list(nn3.parameters()) + [theta],
-    lr=0.01,
+    [
+        {
+            "params": list(nn1.parameters())
+            + list(nn2.parameters())
+            + list(nn3.parameters()),
+            "lr": args.lr_dyn,
+        },
+        {"params": [edge_logits], "lr": args.lr_adj},
+    ]
 )
+
+
+# ===================
+# Gumbel 温度退火参数校验
+# ===================
+if args.tau_start <= 0 or args.tau_end <= 0:
+    raise ValueError(
+        f"--tau_start / --tau_end 必须为正数，当前 tau_start={args.tau_start}, "
+        f"tau_end={args.tau_end}"
+    )
 
 
 # ====
 # 训练
 # ====
 num_epochs = 100
-RESET_INTERVAL = 100
+Xt_tensor = torch.from_numpy(Xt).to(device)
+Yt_tensor = torch.from_numpy(Yt).to(device)
+
+# A_true转numpy，供每个epoch的结构评价和最终评价使用
+A_true_np = A_true.astype(np.int64)
 
 # =============
 # 第一层：epoch
 # =============
+# trace_done = False
 for epoch in range(num_epochs):
+    # 平滑指数退火：epoch=0 时 temperature == tau_start，最后一轮 == tau_end
+    progress = epoch / max(num_epochs - 1, 1)
+    temperature = args.tau_start * (args.tau_end / args.tau_start) ** progress
 
-    # 用来统计当前epoch的loss
-    epoch_loss = 0.0
-
-    # 当前epoch一共训练了多少个节点样本
+    epoch_pred = 0.0
+    epoch_sparse = 0.0
+    epoch_total = 0.0
+    epoch_gate_mean = 0.0
     sample_count = 0
+    num_batches = 0
+
+    # 每个batch同时训练多个时间样本和全部目标节点
+    for start in range(0, Xt_tensor.shape[0], args.batch_size):
+        # X_batch: [B,N]   B=batch内时间样本数，N=节点数，值∈{0,1,2}
+        # Y_batch: [B,N]   B=batch内时间样本数，N=节点数，值∈{0,1,2}，dtype=long
+        X_batch = Xt_tensor[start : start + args.batch_size]
+        Y_batch = Yt_tensor[start : start + args.batch_size]
+
+        optimizer.zero_grad(set_to_none=True)
+
+        # ----------------------------------------
+        # 邻接采样（Gumbel-Softmax）
+        # ----------------------------------------
+        # edge_logits: [num_upper,2] -> edge_prob: [num_upper]
+        #             -> edge_sample_two_class: [num_upper,2]
+        #             -> sampled_edge_gate: [num_upper]
+        #             -> A_sampled: [N,N]（严格对称、对角全0）
+        (
+            A_sampled,
+            sampled_edge_gate,
+            edge_prob,
+            edge_sample_two_class,
+        ) = sample_gumbel_adjacency(
+            edge_logits,
+            tri_i,
+            tri_j,
+            n,
+            device,
+            temperature,
+            args.gumbel_hard,
+        )
+
+        # ----------------------------------------
+        # 构造所有节点对的 pairwise 输入
+        # ----------------------------------------
+        # x_batch: [B,N,1]  （X_batch.unsqueeze(-1)，每节点1维状态）
+        x_batch = X_batch.unsqueeze(-1)
+
+        # source_state: [B,target,source,1]  位置(b,i,j)放 x_j（候选源节点状态）
+        source_state = x_batch.unsqueeze(1).expand(
+            X_batch.shape[0], n, n, 1
+        )
+
+        # target_state: [B,target,source,1]  位置(b,i,j)放 x_i（目标节点状态）
+        target_state = x_batch.unsqueeze(2).expand(
+            X_batch.shape[0], n, n, 1
+        )
+
+        # pair_input: [B,target,source,2]  cat([x_j, x_i], dim=-1)
+        # pair_input[b,i,j] == [X_batch[b,j], X_batch[b,i]]
+        pair_input = torch.cat((source_state, target_state), dim=-1)
+
+        # h1: [B,target,source,F]  每条消息h1[b,i,j]只依赖x_i、x_j和NN1共享参数
+        h1 = nn1(pair_input)
+
+        # neighbor_sum: [B,target,F]
+        # einsum("st,btsf->btf")：A_sampled[source,target] 乘 h1[:,target,source,:] 按source求和
+        neighbor_sum = torch.einsum("st,btsf->btf", A_sampled, h1)
+
+        # h2: [B,target,F]  NN2处理后的聚合邻居特征
+        h2 = nn2(neighbor_sum)
+
+        # nn3_input: [B,target,F+1]  cat([h2, x_i], dim=-1)
+        nn3_input = torch.cat((h2, X_batch.unsqueeze(-1)), dim=-1)
+
+        # prediction: [B,target,3]  NN3输出的logits（0=S,1=I,2=R）
+        prediction = nn3(nn3_input)
+
+        # prediction_loss: 标量  CrossEntropyLoss（reshape成 [-1,3] vs [-1]）
+        prediction_loss = criterion(
+            prediction.reshape(-1, nn3_output_dim), Y_batch.reshape(-1)
+        )
+
+        # sparse_loss: 标量  使用确定性期望边概率，避免Gumbel采样抖动
+        # edge_prob: [num_upper]（每条唯一上三角边只计一次）
+        sparse_loss = edge_prob.mean()
+
+        # total_loss: 标量 = prediction_loss + lambda_sparse * sparse_loss
+        total_loss = prediction_loss + args.lambda_sparse * sparse_loss
+
+        # -------------------------------------------------
+        # 一次性 shape trace（仅第一个epoch的第一个batch）
+        # 调试用，训练时暂时注释掉；需要时取消注释并加 --trace_shapes
+        # -------------------------------------------------
+        # if args.trace_shapes and not trace_done:
+        #     trace_tensor("1. X_batch", X_batch)
+        #     trace_tensor("2. x_batch", x_batch)
+        #     trace_tensor("3. source_state", source_state)
+        #     trace_tensor("4. target_state", target_state)
+        #     trace_tensor("5. pair_input", pair_input)
+        #     trace_tensor("6. h1", h1)
+        #     trace_tensor("7. edge_logits", edge_logits)
+        #     trace_tensor("8. edge_prob", edge_prob)
+        #     trace_tensor("9. edge_sample_two_class", edge_sample_two_class)
+        #     trace_tensor("10. sampled_edge_gate", sampled_edge_gate)
+        #     trace_tensor("11. A_sampled", A_sampled)
+        #     trace_tensor("12. neighbor_sum", neighbor_sum)
+        #     trace_tensor("13. h2", h2)
+        #     trace_tensor("14. nn3_input", nn3_input)
+        #     trace_tensor("15. prediction", prediction)
+        #     trace_tensor("16. Y_batch", Y_batch)
+        #     trace_tensor("17. prediction_loss", prediction_loss)
+        #     trace_tensor("18. sparse_loss", sparse_loss)
+        #     trace_tensor("19. total_loss", total_loss)
+
+        total_loss.backward()
+
+        # 反向传播后：确认梯度确实经Gumbel-Softmax回到结构参数（调试用）
+        # if args.trace_shapes and not trace_done:
+        #     g = edge_logits.grad
+        #     print(
+        #         f"[trace] edge_logits.grad | shape={tuple(g.shape)} "
+        #         f"min={g.min().item():.6f} max={g.max().item():.6f} "
+        #         f"mean={g.mean().item():.6f} norm={g.norm().item():.6f}"
+        #     )
+        #     p0 = list(nn1.parameters())[0]
+        #     print(f"[trace] NN1 第一个参数梯度 norm = {p0.grad.norm().item():.6f}")
+        #     trace_done = True
+
+        optimizer.step()
+
+        batch_sample_count = Y_batch.numel()
+        epoch_pred += prediction_loss.detach().item() * batch_sample_count
+        epoch_sparse += sparse_loss.detach().item() * batch_sample_count
+        epoch_total += total_loss.detach().item() * batch_sample_count
+        epoch_gate_mean += sampled_edge_gate.detach().mean().item()
+        sample_count += batch_sample_count
+        num_batches += 1
+
+    # -------------------
+    # 每个epoch的日志
+    # -------------------
+    with torch.no_grad():
+        current_edge_prob = torch.softmax(edge_logits, dim=-1)[:, 1]
+        mean_edge_probability = current_edge_prob.mean().item()
+        thresholded_edge_count = (
+            current_edge_prob >= args.threshold
+        ).sum().item()
+        # 每个epoch的结构恢复评价（确定性edge_prob vs A_true，严格上三角）
+        roc_auc, pr_auc, precision, recall, f1, accuracy, shd = evaluate_structure(
+            current_edge_prob, A_true_np, args.threshold, tri_i, tri_j, n
+        )
+
+    mean_sampled_gate = epoch_gate_mean / max(num_batches, 1)
+
+    print(
+        f"CoND Epoch {epoch + 1}/{num_epochs} | "
+        f"temperature = {temperature:.4f} | hard = {args.gumbel_hard} | "
+        f"pred_loss = {epoch_pred / sample_count:.6f} | "
+        f"sparse_loss = {epoch_sparse / sample_count:.6f} | "
+        f"total_loss = {epoch_total / sample_count:.6f} | "
+        f"mean_edge_probability = {mean_edge_probability:.4f} | "
+        f"mean_sampled_gate = {mean_sampled_gate:.4f} | "
+        f"edges = {thresholded_edge_count}"
+    )
+    print(
+        f"  eval: ROC-AUC = {roc_auc:.4f} | PR-AUC = {pr_auc:.4f} | "
+        f"Precision = {precision:.4f} | Recall = {recall:.4f} | "
+        f"F1 = {f1:.4f} | Accuracy = {accuracy:.4f} | SHD = {shd}"
+    )
 
 
-    # ============
-    # 第二层：time
-    # ============
-    # Xt共有1000个时间点
-    # t=0   -> t=1
-    # t=1   -> t=2
-    # ...
-    # t=998 -> t=999
-    # 这里只遍历到倒数第二个时刻
-    # 每100个时间步的人为重置转移不参与训练
-    for t in range(Xt.shape[0] - 1):
-        # 跳过人为重置产生的状态转移
-        if (t + 1) % RESET_INTERVAL == 0:
-            continue
-
-        # 当前时刻整个网络状态 X^t
-        # 原始维度：(100,)
-        X_t = Xt[t]
-
-
-        # ============
-        # 第三层：node
-        # ============
-        # 遍历当前网络的100个节点
-        for target_node in range(Xt.shape[1]):
-
-            # 每个节点开始前清空梯度
-            optimizer.zero_grad()
-
-            # 当前节点状态
-            # 当前时刻目标节点状态 x_i^t
-            x_i_t = Xt[t,target_node]
-
-            # 下一时刻目标节点真实状态 x_i^(t+1)
-            target_next = Xt[t+1,target_node]
-
-
-            # =========
-            # 整理 X^t
-            # =========
-            # X_t：
-            # (100,) -> (1,100)
-            X_t_input = X_t.reshape(1,-1)
-
-
-            # =====================
-            # 整理 x_i^t
-            # =====================
-            # 标量 -> 1×1
-            x_i_input = np.array([[x_i_t]])
-
-
-            # =============
-            # 构造融合层输入
-            # =============
-            # x_i^t：1×1
-            # X^t：1×100
-            # 拼接：1×101
-            NN1_input = np.concatenate((x_i_input,X_t_input),axis=1)
-
-
-            # numpy -> torch
-            nn1_input = torch.tensor(NN1_input,dtype=torch.float32).cuda()
-
-
-            # =====================
-            # 当前节点状态转Tensor
-            # =====================
-            # 维度：1×1
-            x_i_tensor = torch.tensor(x_i_input,dtype=torch.float32).cuda()
-
-
-            # =====
-            # NN1
-            # =====
-            # 输入：1×101
-            # 输出：100×32
-            h1 = nn1(nn1_input)
-
-
-            # =======================
-            # 生成可学习的邻接概率矩阵
-            # =======================
-            # theta中的任意实数
-            # 经过sigmoid后映射到0~1
-            A_hat = torch.sigmoid(theta)
-
-            # 对角线强制为0
-            A_hat = A_hat * identity_mask
-
-
-            # ======================
-            # 取目标节点对应的列
-            # ======================
-            # A_hat[:,target_node]
-            # 维度：(100,)
-            A_column = A_hat[:,target_node]
-
-            # (100,) -> (1,100)
-            A_column = A_column.reshape(1,n)
-
-
-            # ======================
-            # 聚合邻居信息
-            # ======================
-            # A_column：1×100
-            # h1：100×32
-            # 得到：neighbor_sum：1×32
-            neighbor_sum = torch.matmul(A_column,h1)
-
-
-            # ======
-            # NN2
-            # ======
-            # 输入：1×32
-            # 输出：1×32
-            h2 = nn2(neighbor_sum)
-
-
-            # =============
-            # 构造 NN3 输入
-            # =============
-            # h2：1×32
-            # x_i_tensor：1×1
-            # 拼接：1×33
-            nn3_input = torch.cat((h2,x_i_tensor),dim=1)
-
-
-            # =========
-            # NN3预测
-            # =========
-            # 输入：1×33
-            # 输出：1×3
-            # 三个logits分别对应：
-            # 0 -> S
-            # 1 -> I
-            # 2 -> R
-            prediction = nn3(nn3_input)
-
-
-            # ============
-            # 构造真实标签
-            # ============
-            # target_next：
-            # 0 / 1 / 2
-            # CrossEntropyLoss要求：
-            # dtype = long
-            # shape = [1]
-            target_label = torch.tensor([target_next],dtype=torch.long).cuda()
-
-
-            # ========
-            # 计算损失
-            # ========
-            loss = criterion(prediction,target_label)
-
-
-            # =========
-            # 反向传播
-            # =========
-            # 当前node算完loss以后立即反向传播
-            loss.backward()
-
-
-            # =========
-            # 更新参数
-            # =========
-            # 当前node反向传播以后立即更新参数
-            optimizer.step()
-
-
-            # ==================
-            # 得到最终SIR预测状态
-            # ==================
-            # 从三个logits中取最大值对应的位置
-            # 得到：0 / 1 / 2
-            state_prediction = torch.argmax(prediction,dim=1)
-
-
-            # =========
-            # 记录loss
-            # =========
-            epoch_loss += loss.item()
-            sample_count += 1
-
-
-    # ==================
-    # 当前epoch平均loss
-    # ==================
-    average_loss = epoch_loss / sample_count
-
-
-    # ===========
-    # 打印训练结果
-    # ===========
-    print(f"ER_{graph_idx} Epoch {epoch+1}/{num_epochs}, Average Loss = {average_loss:.6f}")
-
-
-# =============================
-# 训练结束，得到最终邻接概率矩阵
-# =============================
+# =================================
+# 训练结束：确定性评价（不再采样）
+# =================================
+# 最终边概率只用 softmax 期望，不包含任何Gumbel随机性，
+# 因此同一模型重复评价结果完全一致。
 with torch.no_grad():
-    A_hat_final = torch.sigmoid(theta)
+    # edge_prob_final: [num_upper]
+    edge_prob_final = torch.softmax(edge_logits, dim=-1)[:, 1]
 
-    # 去除自环
-    A_hat_final = A_hat_final * identity_mask
+    # A_hat_final: [N,N] 对称的确定性邻接概率矩阵（对角线恒为0）
+    A_hat_final = torch.zeros(n, n, device=device)
+    A_hat_final[tri_i, tri_j] = edge_prob_final
+    A_hat_final[tri_j, tri_i] = edge_prob_final
 
+# A_recovered: [N,N] 对称的0/1邻接矩阵（阈值来自命令行参数，默认0.5）
+A_recovered = (A_hat_final >= args.threshold).float()
 
-# =========================
-# 恢复0/1邻接矩阵
-# =========================
-threshold = 0.5
-A_recovered = (A_hat_final >= threshold).float()
+A_hat_np = A_hat_final.cpu().numpy()
+A_recovered_np = A_recovered.cpu().numpy().astype(np.int64)
+
+# 无向图：边数 = 对称矩阵非零元素数的一半
+predicted_edges = int(A_recovered.sum().item() / 2)
 
 
 # ==========
 # 输出结果
 # ==========
-print("最终邻接概率矩阵 A_hat_final：",A_hat_final)
-print("恢复后的0/1邻接矩阵 A_recovered：",A_recovered)
+print()
+print("最终邻接概率矩阵 A_hat_final（对称、确定性）：")
+print(A_hat_final)
+print("恢复后的0/1邻接矩阵 A_recovered（对称）：")
+print(A_recovered)
+print(f"预测边数 = {predicted_edges}")
 
 
 # =========================
-# 只取邻接矩阵上三角部分
+# 只取邻接矩阵严格上三角部分并计算评价指标
 # =========================
-upper_indices = np.triu_indices(n,k=1)
+upper_indices = np.triu_indices(n, k=1)
 
-A_true_eval = A_true_np[upper_indices]
-A_hat_eval = A_hat_np[upper_indices]
-A_recovered_eval = A_recovered_np[upper_indices]
+print()
+print(f"严格上三角索引数量: {len(upper_indices[0])}")
 
-
-# =========================
-# 计算评价指标
-# =========================
-roc_auc = roc_auc_score(A_true_eval,A_hat_eval)
-pr_auc = average_precision_score(A_true_eval,A_hat_eval)
-
-precision = precision_score(A_true_eval,A_recovered_eval,zero_division=0)
-recall = recall_score(A_true_eval,A_recovered_eval,zero_division=0)
-f1 = f1_score(A_true_eval,A_recovered_eval,zero_division=0)
-accuracy = accuracy_score(A_true_eval,A_recovered_eval)
-
-
-# =========================
-# 计算SHD
-# =========================
-shd = np.sum(A_true_eval != A_recovered_eval)
+roc_auc, pr_auc, precision, recall, f1, accuracy, shd = evaluate_structure(
+    edge_prob_final, A_true_np, args.threshold, tri_i, tri_j, n
+)
 
 
 # =========================
