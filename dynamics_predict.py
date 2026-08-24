@@ -13,6 +13,7 @@ from sklearn.metrics import (
     f1_score,
     accuracy_score,
 )
+import sys
 
 
 # ================
@@ -128,9 +129,11 @@ def load_cond_data(data_dir, dynamics_type):
 #   A_sampled 严格对称；对角线严格为零；
 #   Gumbel-Softmax 的梯度回传到 edge_logits。
 def sample_gumbel_adjacency(edge_logits, tri_i, tri_j, n, device, temperature, hard):
+    # print("edge_logits", edge_logits)
     # 1. 确定性边概率（期望）：softmax 的第二个分量 = 边的概率
     edge_prob = torch.softmax(edge_logits, dim=-1)[:, 1]  # [num_upper]
 
+    # print("edge_prob", edge_prob)
     # 2. 二分类 Gumbel-Softmax 采样（训练路径，可导）
     edge_sample_two_class = F.gumbel_softmax(
         edge_logits,
@@ -139,6 +142,8 @@ def sample_gumbel_adjacency(edge_logits, tri_i, tri_j, n, device, temperature, h
         dim=-1,
     )  # [num_upper, 2]
 
+    # print("edge_sample_two_class", edge_sample_two_class)
+    # sys.exit()
     # 3. 取出"是边"的分量作为门控
     sampled_edge_gate = edge_sample_two_class[:, 1]  # [num_upper]
 
@@ -182,37 +187,6 @@ def evaluate_structure(edge_prob, A_true_np, threshold, tri_i, tri_j, n):
     return roc_auc, pr_auc, precision, recall, f1, accuracy, shd
 
 
-# ================================
-# 一次性 shape trace（--trace_shapes）
-# 调试用，训练时暂时注释掉；需要时取消注释并加 --trace_shapes
-# ================================
-# def trace_tensor(name, tensor, max_values=6):
-#     req = tensor.requires_grad
-#     t = tensor.detach()
-#     flat = t.reshape(-1)
-#     vals = flat[:max_values].tolist()
-#
-#     if t.numel() > 0:
-#         mn, mx = t.min().item(), t.max().item()
-#         if t.dtype.is_floating_point:
-#             mean = t.mean().item()
-#         else:
-#             mean = t.float().mean().item()
-#     else:
-#         mn = mx = mean = float("nan")
-#
-#     if t.dtype.is_floating_point:
-#         vstr = ", ".join(f"{v:.4f}" for v in vals)
-#     else:
-#         vstr = ", ".join(str(int(v)) for v in vals)
-#
-#     print(
-#         f"[trace] {name} | shape={tuple(t.shape)} dtype={t.dtype} "
-#         f"device={t.device} requires_grad={req} "
-#         f"min={mn:.4f} max={mx:.4f} mean={mean:.4f} | first={vstr}"
-#     )
-
-
 # ===============
 # CoND数据路径参数
 # ===============
@@ -228,7 +202,6 @@ parser.add_argument("--threshold", type=float, default=0.5)
 parser.add_argument("--tau_start", type=float, default=1.0)
 parser.add_argument("--tau_end", type=float, default=0.5)
 parser.add_argument("--gumbel_hard", action="store_true", default=False)
-parser.add_argument("--trace_shapes", action="store_true", default=False)
 parser.add_argument("--seed", type=int, default=42)
 args = parser.parse_args()
 
@@ -367,7 +340,6 @@ A_true_np = A_true.astype(np.int64)
 # =============
 # 第一层：epoch
 # =============
-# trace_done = False
 for epoch in range(num_epochs):
     # 平滑指数退火：epoch=0 时 temperature == tau_start，最后一轮 == tau_end
     progress = epoch / max(num_epochs - 1, 1)
@@ -411,6 +383,13 @@ for epoch in range(num_epochs):
             args.gumbel_hard,
         )
 
+        # print("A_sampled:", A_sampled)
+        # print("sampled_edge_gate:", sampled_edge_gate)
+        # print("edge_prob:", edge_prob)
+        # print("edge_sample_two_class:", edge_sample_two_class)
+
+        # sys.exit()
+
         # ----------------------------------------
         # 构造所有节点对的 pairwise 输入
         # ----------------------------------------
@@ -422,10 +401,12 @@ for epoch in range(num_epochs):
             X_batch.shape[0], n, n, 1
         )
 
+
         # target_state: [B,target,source,1]  位置(b,i,j)放 x_i（目标节点状态）
         target_state = x_batch.unsqueeze(2).expand(
             X_batch.shape[0], n, n, 1
         )
+
 
         # pair_input: [B,target,source,2]  cat([x_j, x_i], dim=-1)
         # pair_input[b,i,j] == [X_batch[b,j], X_batch[b,i]]
@@ -459,45 +440,7 @@ for epoch in range(num_epochs):
         # total_loss: 标量 = prediction_loss + lambda_sparse * sparse_loss
         total_loss = prediction_loss + args.lambda_sparse * sparse_loss
 
-        # -------------------------------------------------
-        # 一次性 shape trace（仅第一个epoch的第一个batch）
-        # 调试用，训练时暂时注释掉；需要时取消注释并加 --trace_shapes
-        # -------------------------------------------------
-        # if args.trace_shapes and not trace_done:
-        #     trace_tensor("1. X_batch", X_batch)
-        #     trace_tensor("2. x_batch", x_batch)
-        #     trace_tensor("3. source_state", source_state)
-        #     trace_tensor("4. target_state", target_state)
-        #     trace_tensor("5. pair_input", pair_input)
-        #     trace_tensor("6. h1", h1)
-        #     trace_tensor("7. edge_logits", edge_logits)
-        #     trace_tensor("8. edge_prob", edge_prob)
-        #     trace_tensor("9. edge_sample_two_class", edge_sample_two_class)
-        #     trace_tensor("10. sampled_edge_gate", sampled_edge_gate)
-        #     trace_tensor("11. A_sampled", A_sampled)
-        #     trace_tensor("12. neighbor_sum", neighbor_sum)
-        #     trace_tensor("13. h2", h2)
-        #     trace_tensor("14. nn3_input", nn3_input)
-        #     trace_tensor("15. prediction", prediction)
-        #     trace_tensor("16. Y_batch", Y_batch)
-        #     trace_tensor("17. prediction_loss", prediction_loss)
-        #     trace_tensor("18. sparse_loss", sparse_loss)
-        #     trace_tensor("19. total_loss", total_loss)
-
         total_loss.backward()
-
-        # 反向传播后：确认梯度确实经Gumbel-Softmax回到结构参数（调试用）
-        # if args.trace_shapes and not trace_done:
-        #     g = edge_logits.grad
-        #     print(
-        #         f"[trace] edge_logits.grad | shape={tuple(g.shape)} "
-        #         f"min={g.min().item():.6f} max={g.max().item():.6f} "
-        #         f"mean={g.mean().item():.6f} norm={g.norm().item():.6f}"
-        #     )
-        #     p0 = list(nn1.parameters())[0]
-        #     print(f"[trace] NN1 第一个参数梯度 norm = {p0.grad.norm().item():.6f}")
-        #     trace_done = True
-
         optimizer.step()
 
         batch_sample_count = Y_batch.numel()
@@ -507,6 +450,8 @@ for epoch in range(num_epochs):
         epoch_gate_mean += sampled_edge_gate.detach().mean().item()
         sample_count += batch_sample_count
         num_batches += 1
+
+        # sys.exit()
 
     # -------------------
     # 每个epoch的日志
