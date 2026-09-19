@@ -76,6 +76,44 @@ class NN3(nn.Module):
         return x
 
 
+# ==================================
+# 按离散状态聚合 pairwise 消息
+# ==================================
+def aggregate_pairwise_messages(nn1, X_batch, A_sampled, state_values):
+    """等价计算所有节点对的 NN1 消息，但不创建 [B,N,N,F] 张量。"""
+    num_states = state_values.numel()
+
+    # message_table[target_state, source_state] = NN1([x_source, x_target])
+    source_values = state_values.reshape(1, num_states).expand(
+        num_states, num_states
+    )
+    target_values = state_values.reshape(num_states, 1).expand(
+        num_states, num_states
+    )
+    state_pair_input = torch.stack((source_values, target_values), dim=-1)
+    message_table = nn1(state_pair_input)  # [K,K,F]
+
+    # 标记每个节点的离散状态；CoND 的 Ising/SIS/voter/threshold/SIR
+    # 都只有少量离散状态，因此 K 远小于节点数 N。
+    state_one_hot = (X_batch.unsqueeze(-1) == state_values).to(A_sampled.dtype)
+    if not torch.all(state_one_hot.sum(dim=-1) == 1):
+        raise ValueError("X_batch contains a state not present in state_values")
+
+    # 对每个目标节点，分别求处于各状态的源节点的邻接权重之和：
+    # sum_s A[source=s,target=t] * 1[x_s == state_k]
+    source_weight_by_state = torch.einsum(
+        "st,bsk->btk", A_sampled, state_one_hot
+    )  # [B,N,K]
+
+    # 根据每个目标节点自身的状态选取对应的 K 组消息，再对源状态求和。
+    target_state_index = state_one_hot.argmax(dim=-1)  # [B,N]
+    messages_for_target = message_table[target_state_index]  # [B,N,K,F]
+    neighbor_sum = torch.einsum(
+        "btk,btkf->btf", source_weight_by_state, messages_for_target
+    )
+    return neighbor_sum
+
+
 # ==========
 # 读取数据
 # ==========
@@ -97,6 +135,30 @@ def load_cond_data(data_dir, dynamics_type):
     if edge_or_adjacency.shape == (n, n):
         A_true = edge_or_adjacency
     else:
+        # CoND 的部分边列表（例如 data/email/email.txt）使用从 1 开始的
+        # 节点编号，而 NumPy 下标从 0 开始。email 有 1133 个节点，边表中
+        # 的最大编号也正好是 1133；若直接作为下标就会发生越界。
+        edge_or_adjacency = np.atleast_2d(edge_or_adjacency)
+        if edge_or_adjacency.shape[1] != 2:
+            raise ValueError(
+                f"edge list must have exactly 2 columns, got shape "
+                f"{edge_or_adjacency.shape} in {data_dir / f'{network_name}.txt'}"
+            )
+
+        min_node = int(edge_or_adjacency.min())
+        max_node = int(edge_or_adjacency.max())
+        if min_node >= 1 and max_node == n:
+            # 1-based node IDs: [1, n] -> [0, n-1]
+            edge_or_adjacency = edge_or_adjacency - 1
+
+        min_node = int(edge_or_adjacency.min())
+        max_node = int(edge_or_adjacency.max())
+        if min_node < 0 or max_node >= n:
+            raise ValueError(
+                f"edge-list node IDs must be within [0, {n - 1}] (0-based) "
+                f"or [1, {n}] (1-based); got [{min_node}, {max_node}]"
+            )
+
         A_true = np.zeros((n, n), dtype=np.int64)
         source = edge_or_adjacency[:, 0]
         target = edge_or_adjacency[:, 1]
@@ -108,6 +170,17 @@ def load_cond_data(data_dir, dynamics_type):
 
     return Xt, Yt, A_true
 
+# def load_cond_data(data_dir, dynamics_type):
+#     data = np.load("/home/cwq/Aidd New/data/data.npz")
+#     # 先使用第0张网络
+#     A_true = data["all_A"][0].astype(np.int64)
+#     # 第0张网络的完整动力学轨迹
+#     trajectory = data["all_Xt"][0]
+#     # t 时刻作为输入
+#     Xt = trajectory[:-1].astype(np.float32)
+#     # t+1 时刻作为预测目标
+#     Yt = trajectory[1:].astype(np.int64)
+#     return Xt, Yt, A_true
 
 # ================================
 # 无向 Gumbel-Softmax 邻接采样
@@ -192,7 +265,7 @@ def evaluate_structure(edge_prob, A_true_np, threshold, tri_i, tri_j, n):
 # ===============
 parser = argparse.ArgumentParser()
 parser.add_argument("--data_dir", default="CoND-main/data/BA_N200_m2")
-parser.add_argument("--dynamics_type", default="SIR")
+parser.add_argument("--dynamics_type", default="voter")
 parser.add_argument("--batch_size", type=int, default=8)
 parser.add_argument("--lambda_sparse", type=float, default=0.01)
 parser.add_argument("--init_edge_prob", type=float, default=0.05)
@@ -224,7 +297,7 @@ print("==============================")
 # 创建 NN1
 # =========
 # 隐藏维度 F
-F_dim = 32
+F_dim = 128
 n = Xt.shape[1]
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # 输入为节点对拼接 [x_j, x_i]，维度2与n无关
@@ -333,6 +406,8 @@ if args.tau_start <= 0 or args.tau_end <= 0:
 num_epochs = 100
 Xt_tensor = torch.from_numpy(Xt).to(device)
 Yt_tensor = torch.from_numpy(Yt).to(device)
+state_values = torch.unique(Xt_tensor)
+print(f"动力学离散状态: {state_values.detach().cpu().tolist()}")
 
 # A_true转numpy，供每个epoch的结构评价和最终评价使用
 A_true_np = A_true.astype(np.int64)
@@ -391,33 +466,15 @@ for epoch in range(num_epochs):
         # sys.exit()
 
         # ----------------------------------------
-        # 构造所有节点对的 pairwise 输入
+        # 按离散状态等价聚合所有 pairwise 消息
         # ----------------------------------------
-        # x_batch: [B,N,1]  （X_batch.unsqueeze(-1)，每节点1维状态）
-        x_batch = X_batch.unsqueeze(-1)
-
-        # source_state: [B,target,source,1]  位置(b,i,j)放 x_j（候选源节点状态）
-        source_state = x_batch.unsqueeze(1).expand(
-            X_batch.shape[0], n, n, 1
-        )
-
-
-        # target_state: [B,target,source,1]  位置(b,i,j)放 x_i（目标节点状态）
-        target_state = x_batch.unsqueeze(2).expand(
-            X_batch.shape[0], n, n, 1
-        )
-
-
-        # pair_input: [B,target,source,2]  cat([x_j, x_i], dim=-1)
-        # pair_input[b,i,j] == [X_batch[b,j], X_batch[b,i]]
-        pair_input = torch.cat((source_state, target_state), dim=-1)
-
-        # h1: [B,target,source,F]  每条消息h1[b,i,j]只依赖x_i、x_j和NN1共享参数
-        h1 = nn1(pair_input)
-
-        # neighbor_sum: [B,target,F]
-        # einsum("st,btsf->btf")：A_sampled[source,target] 乘 h1[:,target,source,:] 按source求和
-        neighbor_sum = torch.einsum("st,btsf->btf", A_sampled, h1)
+        # 原实现显式创建 h1 [B,N,N,F]。email 数据在 B=8、N=1133、F=128
+        # 时，仅 h1 就需要约 4.9 GiB，反向传播还要保存多份中间激活。
+        # NN1 的输入只由源/目标节点的离散状态决定，因此先计算 K*K 个唯一
+        # 状态对的消息，再按邻接矩阵聚合；结果与逐节点对计算严格等价。
+        neighbor_sum = aggregate_pairwise_messages(
+            nn1, X_batch, A_sampled, state_values
+        )  # [B,target,F]
 
         # h2: [B,target,F]  NN2处理后的聚合邻居特征
         h2 = nn2(neighbor_sum)
