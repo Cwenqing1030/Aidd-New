@@ -140,9 +140,9 @@ def initialize_sir_state(
     x = torch.full((N,), S_STATE, dtype=torch.long, device=device)
     perm = torch.randperm(N, device=device)
     x[perm[:n_infected]] = I_STATE
-    if n_recovered > 0:
-        x[perm[n_infected : n_infected + n_recovered]] = R_STATE
-    return x
+    #if n_recovered > 0:
+        #x[perm[n_infected : n_infected + n_recovered]] = R_STATE
+    #return x ？？？
 
 
 @torch.no_grad()
