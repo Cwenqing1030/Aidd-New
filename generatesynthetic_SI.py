@@ -1,5 +1,5 @@
 """在固定的三元超图上生成 SI 一步预测数据。0=S，1=I，无恢复。"""
-
+# 更改版本
 import argparse
 from pathlib import Path
 
