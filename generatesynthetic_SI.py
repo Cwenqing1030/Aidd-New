@@ -90,7 +90,7 @@ def main() -> None:
 
     N, E, k = 200, 400, 3
     num_pairs, episode_length = 500, 12
-    init_infected, beta = 50, 0.10
+    init_infected, beta = 5, 0.10
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
     if device.type == "cuda":
