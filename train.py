@@ -5,9 +5,12 @@ import csv
 from pathlib import Path
 
 import numpy as np
+import swanlab
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
+import config
+import swanlab_config
+from data.dataset import load_data, make_loader, split_trajectories
 
 from Models import AIDDNeighborPairDynamics, GumbelNeighborPairGenerator
 from metrics import (
@@ -21,26 +24,36 @@ from metrics import (
 
 
 def parse_args():
-    root = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", default=str(root / "data" / "hypergraph_N50"))
-    parser.add_argument("--network_name", default="hypergraph_N50")
-    parser.add_argument("--output_dir", default=str(root / "outputs_SIR_aidd_rows"))
-    parser.add_argument("--train_ratio", type=float, default=0.70)
-    parser.add_argument("--val_ratio", type=float, default=0.15)
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--F_dim", type=int, default=128)
-    parser.add_argument("--pair_chunk_size", type=int, default=4096)
-    parser.add_argument("--lr_dyn", type=float, default=0.001)
-    parser.add_argument("--lr_structure", type=float, default=0.004)
-    parser.add_argument("--lambda_sparse", type=float, default=0.0001)
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--init_edge_prob", type=float, default=0.001)
-    parser.add_argument("--init_std", type=float, default=0.1)
-    parser.add_argument("--gumbel_hard", action="store_true", default=False)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--data_dir", default=str(config.DATA_DIR))
+    parser.add_argument("--network_name", default=None)
+    parser.add_argument(
+        "--dynamics_name", default=config.DYNAMICS_NAME, choices=("SIR",),
+        help="动力学名称；当前训练入口支持 SIR",
+    )
+    parser.add_argument("--output_dir", default=None)
+    parser.add_argument("--train_ratio", type=float, default=config.TRAIN_RATIO)
+    parser.add_argument("--val_ratio", type=float, default=config.VAL_RATIO)
+    parser.add_argument("--epochs", type=int, default=config.EPOCHS)
+    parser.add_argument("--batch_size", type=int, default=config.BATCH_SIZE)
+    parser.add_argument("--F_dim", type=int, default=config.FEATURE_DIM)
+    parser.add_argument("--pair_chunk_size", type=int, default=config.PAIR_CHUNK_SIZE)
+    parser.add_argument("--lr_dyn", type=float, default=config.LR_DYN)
+    parser.add_argument("--lr_structure", type=float, default=config.LR_STRUCTURE)
+    parser.add_argument("--lambda_sparse", type=float, default=config.LAMBDA_SPARSE)
+    parser.add_argument("--temperature", type=float, default=config.TEMPERATURE)
+    parser.add_argument("--init_edge_prob", type=float, default=config.INIT_EDGE_PROB)
+    parser.add_argument("--init_std", type=float, default=config.INIT_STD)
+    parser.add_argument("--gumbel_hard", action="store_true", default=config.GUMBEL_HARD)
+    parser.add_argument("--seed", type=int, default=config.SEED)
     args = parser.parse_args()
+    if args.network_name is None:
+        args.network_name = Path(args.data_dir).name
+    if args.output_dir is None:
+        args.output_dir = str(
+            config.OUTPUT_ROOT / args.network_name
+            / f"{args.dynamics_name}_train_seed{args.seed}"
+        )
     if not (0 < args.train_ratio < 1 and 0 < args.val_ratio < 1
             and args.train_ratio + args.val_ratio < 1):
         parser.error("train_ratio、val_ratio 必须为正，且两者之和小于 1")
@@ -50,67 +63,9 @@ def parse_args():
         parser.error("lambda_sparse 必须非负")
     if not 0 < args.init_edge_prob < 1:
         parser.error("init_edge_prob 必须在 (0,1) 内")
-    if args.temperature <= 0 or args.init_std <= 0:
-        parser.error("temperature 和 init_std 必须为正")
+    if args.temperature <= 0 or args.init_std < 0:
+        parser.error("temperature 必须为正，init_std 必须非负")
     return args
-
-
-def load_data(data_dir, network_name):
-    data_dir = Path(data_dir)
-    x = np.loadtxt(
-        data_dir / f"{network_name}_SIR_x.txt", dtype=np.float32, ndmin=2
-    )
-    y = np.loadtxt(
-        data_dir / f"{network_name}_SIR_y.txt", dtype=np.int64, ndmin=2
-    )
-    sample_index = np.loadtxt(
-        data_dir / f"{network_name}_SIR_index.txt", dtype=np.int64, ndmin=2
-    )
-    hyperedges = np.loadtxt(
-        data_dir / f"{network_name}.txt", dtype=np.int64, ndmin=2
-    )
-    if x.shape != y.shape or sample_index.shape != (len(x), 2):
-        raise ValueError("X、Y 必须同形，index 必须有对应的轨迹编号和时间步两列")
-    if not (np.isin(x, [0, 1, 2]).all() and np.isin(y, [0, 1, 2]).all()):
-        raise ValueError("SIR 状态必须是 0=S、1=I、2=R")
-
-    # 同一轮中相邻的状态对必须连续，跨轮重置不作为动力学转移。
-    same_trajectory = sample_index[1:, 0] == sample_index[:-1, 0]
-    if not np.array_equal(x[1:][same_trajectory], y[:-1][same_trajectory]):
-        raise ValueError("轮内 X/Y 不连续，请检查同步的数据和 index 是否对应")
-
-    n, e = x.shape[1], len(hyperedges)
-    b_true = np.zeros((n, e), dtype=np.int64)
-    b_true[hyperedges, np.arange(e)[:, None]] = 1
-    return x, y, sample_index, b_true
-
-
-def split_trajectories(sample_index, train_ratio, val_ratio, seed):
-    trajectory_ids = np.unique(sample_index[:, 0])
-    trajectory_ids = np.random.default_rng(seed).permutation(trajectory_ids)
-    n_train = int(len(trajectory_ids) * train_ratio)
-    n_val = int(len(trajectory_ids) * val_ratio)
-    if min(n_train, n_val, len(trajectory_ids) - n_train - n_val) < 1:
-        raise ValueError("轨迹数不足以划分出非空的训练、验证、测试集")
-    groups = {
-        "train": trajectory_ids[:n_train],
-        "val": trajectory_ids[n_train:n_train + n_val],
-        "test": trajectory_ids[n_train + n_val:],
-    }
-    rows = {
-        name: np.flatnonzero(np.isin(sample_index[:, 0], ids))
-        for name, ids in groups.items()
-    }
-    return rows, groups
-
-
-def make_loader(x, y, rows, batch_size, shuffle=False, generator=None):
-    dataset = TensorDataset(
-        torch.from_numpy(x[rows]), torch.from_numpy(y[rows])
-    )
-    return DataLoader(
-        dataset, batch_size=batch_size, shuffle=shuffle, generator=generator
-    )
 
 
 @torch.no_grad()
@@ -156,17 +111,51 @@ def evaluate(generator, dynamics, loader, device, *, hard=False, fixed_rows=None
 
 def main():
     args = parse_args()
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    x, y, sample_index, b_true = load_data(args.data_dir, args.network_name)
+    x, y, sample_index, b_true = load_data(
+        args.data_dir, args.network_name, args.dynamics_name
+    )
     incidence_to_triplets(b_true)
     rows, groups = split_trajectories(
         sample_index, args.train_ratio, args.val_ratio, args.seed
     )
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    n = x.shape[1]
+    run = swanlab.init(
+        project=swanlab_config.PROJECT,
+        workspace=swanlab_config.WORKSPACE,
+        experiment_name=swanlab_config.EXPERIMENT_NAME or (
+            f"{args.network_name}_{args.dynamics_name}_train_seed{args.seed}"
+        ),
+        mode=swanlab_config.MODE,
+        logdir=str(output_dir / swanlab_config.LOG_DIR_NAME),
+        config={
+            **vars(args),
+            "N": n,
+            "E": b_true.shape[1],
+            "num_samples": len(x),
+            "num_pairs_per_node": (n - 1) * (n - 2) // 2,
+            "train_trajectories": len(groups["train"]),
+            "val_trajectories": len(groups["val"]),
+            "test_trajectories": len(groups["test"]),
+            "train_samples": len(rows["train"]),
+            "val_samples": len(rows["val"]),
+            "test_samples": len(rows["test"]),
+            "state_encoding": {"S": 0, "I": 1, "R": 2},
+            "structure_rules": ["top_e", "threshold_0_5", "threshold_0_1"],
+        },
+    )
+    for prefix in ("train", "val", "structure"):
+        swanlab.define_metric(f"{prefix}/*", x_axis="epoch")
+    swanlab.define_metric("best/*", x_axis="best_epoch")
+    swanlab.define_metric("epoch", hidden=True)
+    swanlab.define_metric("best_epoch", hidden=True)
+
+    # 在记录器初始化之后设置训练随机种子。
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
     np.savez(
         output_dir / "split_indices.npz",
         train_rows=rows["train"], val_rows=rows["val"], test_rows=rows["test"],
@@ -179,7 +168,6 @@ def main():
     )
     val_loader = make_loader(x, y, rows["val"], args.batch_size)
     test_loader = make_loader(x, y, rows["test"], args.batch_size)
-    n = x.shape[1]
     # 先初始化动力学网络，固定结构对照可用同一个 seed 得到相同的初始权重。
     dynamics = AIDDNeighborPairDynamics(
         n, feature_dim=args.F_dim, pair_chunk_size=args.pair_chunk_size
@@ -190,10 +178,12 @@ def main():
     ).to(device)
     optimizer_dyn = torch.optim.Adam(dynamics.parameters(), lr=args.lr_dyn)
     optimizer_structure = torch.optim.Adam(generator.parameters(), lr=args.lr_structure)
+    neighbor_pairs = dynamics.neighbor_pairs.detach().cpu().numpy()
 
     print(f"script: {Path(__file__).resolve()}")
     print(f"data: {Path(args.data_dir).resolve()}")
     print(f"output: {output_dir.resolve()}")
+    print(f"network: {args.network_name}; dynamics: {args.dynamics_name}")
     print(f"device: {device}; neighbor matrix={n} x {generator.num_pairs}")
     print("states: 0=S, 1=I, 2=R; NN1 input=[x_j(t), x_k(t), x_i(t)]")
     print("structure: independent target rows; class 0=edge, class 1=no-edge")
@@ -247,14 +237,20 @@ def main():
                 degree_sum += expected_degree.detach().item() * x_batch.shape[0]
                 sample_count += x_batch.shape[0]
 
-        val_ce, _, _, _ = evaluate(
+        val_ce, val_true, val_pred, val_prob = evaluate(
             generator, dynamics, val_loader, device,
             hard=args.gumbel_hard, seed=args.seed,
+        )
+        val_metrics = compute_sir_metrics(
+            x[rows["val"]], val_true, val_pred, val_prob, val_ce
         )
         with torch.no_grad():
             row_probability = generator.edge_probabilities()
             expected_row_entries = row_probability.sum().item()
             recovered_row_entries = int((row_probability >= 0.5).sum().item())
+        epoch_structure = compute_neighbor_pair_structure_metrics(
+            b_true, neighbor_pairs, row_probability.cpu().numpy()
+        )
         train_ce = ce_sum / sample_count
         train_sparse = args.lambda_sparse * degree_sum / sample_count
         with history_path.open("a", newline="", encoding="utf-8") as history_file:
@@ -279,6 +275,7 @@ def main():
                     name: value.detach().cpu().clone()
                     for name, value in dynamics.state_dict().items()
                 },
+                "swanlab_run_id": run.id,
                 "architecture": "aidd_neighbor_pairs",
                 "structure_mode": "independent_target_rows",
                 "training_objective": "node_CE + lambda_sparse * expected_row_degree",
@@ -290,6 +287,31 @@ def main():
                 "best_epoch": epoch + 1, "val_CE": val_ce,
             }
             torch.save(best_checkpoint, checkpoint_path)
+
+        # 一个 epoch 汇总一次；真实结构指标只作监控，选模仍只依据 val_CE。
+        epoch_metrics = {
+            "epoch": epoch + 1,
+            "train/CE": train_ce,
+            "train/sparsity": train_sparse,
+            "train/total_loss": train_ce + train_sparse,
+            **{f"val/{name}": value for name, value in val_metrics.items()},
+            "val/best_CE": best_val_ce,
+            "structure/ROC_AUC": epoch_structure["edge_metrics"]["ROC_AUC"],
+            "structure/PR_AUC": epoch_structure["edge_metrics"]["PR_AUC"],
+            "structure/Expected_edges": epoch_structure["edge_metrics"]["Expected_edges"],
+            "structure/expected_row_entries": expected_row_entries,
+            "structure/recovered_row_entries_0_5": recovered_row_entries,
+            "structure/HD_PHD_Pearson": epoch_structure["Pearson"]["HD-PHD"],
+        }
+        for rule, result in epoch_structure["reconstructions"].items():
+            for name in ("Precision", "Recall", "F1", "Recovered_edges"):
+                epoch_metrics[f"structure/{rule}/{name}"] = result["metrics"][name]
+        # 常量序列的 Pearson、单类别的 AUC 可能无定义，不将其写成 0。
+        run.log(
+            {name: value for name, value in epoch_metrics.items() if np.isfinite(value)},
+            step=epoch + 1,
+        )
+        del epoch_structure
 
     if best_checkpoint is None:
         raise RuntimeError("未得到有效的验证结果，请检查训练损失")
@@ -303,7 +325,6 @@ def main():
     test_metrics = compute_sir_metrics(
         x[rows["test"]], y_true, y_pred, y_prob, test_ce
     )
-    neighbor_pairs = dynamics.neighbor_pairs.detach().cpu().numpy()
     row_probability = generator.edge_probabilities().detach().cpu().numpy()
     structure = compute_neighbor_pair_structure_metrics(
         b_true, neighbor_pairs, row_probability
@@ -351,7 +372,7 @@ def main():
     node_metrics, pearson = structure["node_metrics"], structure["Pearson"]
     metric_names = ["HD", "PHD", "HOH", "HOP"]
     metric_matrix = np.column_stack([node_metrics[name] for name in metric_names])
-    pearson_matrix = np.corrcoef(metric_matrix, rowvar=False)
+    pearson_matrix = structure["Pearson_matrix"]
 
     # 行矩阵原样保存。三个独立方向可能不同，不能把原始行阈值矩阵当作无向超图。
     np.savez_compressed(
@@ -409,6 +430,7 @@ def main():
 
     print(f"\nBest epoch: {best_checkpoint['best_epoch']}; val_CE={best_val_ce:.8f}")
     print("\n[Test dynamics | sampled target rows]")
+    print("MSE/MAE use state codes: 0=S, 1=I, 2=R.")
     for name, value in test_metrics.items():
         print(f"{name:26s} = {value:.8f}")
     print("\n[Undirected triplet reconstruction | Top-E / 0.5 / 0.1]")
@@ -433,6 +455,26 @@ def main():
     print(pearson_matrix)
     print_sir_infection_groups(infection_groups)
     print(f"\nSaved results: {output_dir.resolve()}")
+
+    # 恢复最佳权重之后只记录一次测试结果；横轴为该模型的最佳 epoch。
+    final_metrics = {
+        "best_epoch": best_checkpoint["best_epoch"],
+        "best/val_CE": best_val_ce,
+        **{f"best/test/sampled_rows/{name}": value for name, value in test_metrics.items()},
+        **{f"best/structure/{name}": value for name, value in structure["edge_metrics"].items()},
+        **{f"best/Pearson/{name}": value for name, value in pearson.items()},
+    }
+    for rule, values in recovered_metrics_by_rule.items():
+        for name, value in values.items():
+            final_metrics[f"best/test/{rule}/{name}"] = value
+    for rule, result in structure["reconstructions"].items():
+        for name, value in result["metrics"].items():
+            final_metrics[f"best/structure/{rule}/{name}"] = value
+    run.log(
+        {name: value for name, value in final_metrics.items() if np.isfinite(value)},
+        step=args.epochs + 1,
+    )
+    swanlab.finish()
 
 
 if __name__ == "__main__":

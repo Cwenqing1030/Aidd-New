@@ -1,0 +1,4 @@
+numpy
+torch
+scikit-learn
+swanlab>=0.10.0

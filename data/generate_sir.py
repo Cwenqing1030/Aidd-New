@@ -4,23 +4,25 @@
 同一轨迹内 Y[k]=X[k+1]；划分训练集和测试集时按轨迹编号分组。
 """
 
+from math import comb
 from pathlib import Path
 import json
+import sys
 
 import numpy as np
 
 
-N = 50
-E = 400
-NUM_TRAJECTORIES = 1000
-STEPS_PER_TRAJECTORY = 5
-INITIAL_INFECTED = N // 5  # 初始感染比例保持 20%
-BETA = 0.5
-GAMMA = 0.5
-SEED = 42
+# 保持 python data/generate_sir.py 直接运行的入口。
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from config import (
+    N, E, NUM_TRAJECTORIES, STEPS_PER_TRAJECTORY, INITIAL_INFECTED,
+    BETA, GAMMA, SEED, DATA_DIR, NETWORK_NAME,
+)
 
 
 def generate_hypergraph(rng):
+    if N < 3 or not 1 <= E <= comb(N, 3):
+        raise ValueError("三元超图要求 N >= 3，且 1 <= E <= C(N,3)")
     hyperedges = set()
     while len(hyperedges) < E:
         hyperedges.add(tuple(sorted(rng.choice(N, 3, replace=False).tolist())))
@@ -69,15 +71,20 @@ def generate_data():
     y = np.asarray(y, dtype=np.int64)
     sample_index = np.asarray(sample_index, dtype=np.int64)
 
-    prefix = f"hypergraph_N{N}"
-    output_dir = Path(__file__).resolve().parent / prefix
+    # 本脚本始终生成 SIR；网络名只描述拓扑，动力学文件另加 SIR 后缀。
+    dynamics_prefix = f"{NETWORK_NAME}_SIR"
+    output_dir = DATA_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
-    np.savetxt(output_dir / f"{prefix}.txt", hyperedges, fmt="%d")
-    np.savetxt(output_dir / f"{prefix}_SIR_x.txt", x, fmt="%d")
-    np.savetxt(output_dir / f"{prefix}_SIR_y.txt", y, fmt="%d")
-    np.savetxt(output_dir / f"{prefix}_SIR_index.txt", sample_index, fmt="%d")
+    np.savetxt(output_dir / f"{NETWORK_NAME}.txt", hyperedges, fmt="%d")
+    np.savetxt(output_dir / f"{dynamics_prefix}_x.txt", x, fmt="%d")
+    np.savetxt(output_dir / f"{dynamics_prefix}_y.txt", y, fmt="%d")
+    np.savetxt(output_dir / f"{dynamics_prefix}_index.txt", sample_index, fmt="%d")
 
     parameters = {
+        "network_name": NETWORK_NAME,
+        "network_type": "ER",
+        "network_ensemble": "G^(3)(N,E)",
+        "dynamics_name": "SIR",
         "N": N, "E": E, "hyperedge_size": 3,
         "num_trajectories": NUM_TRAJECTORIES, "num_samples": len(x),
         "steps_per_trajectory": STEPS_PER_TRAJECTORY,
@@ -93,7 +100,7 @@ def generate_data():
         "reference": "https://doi.org/10.1063/5.0201557",
         "reference_scope": "beta and gamma only; topology, initialization and trajectory sampling are our choices",
     }
-    (output_dir / "parameters.json").write_text(
+    (output_dir / f"{dynamics_prefix}_parameters.json").write_text(
         json.dumps(parameters, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     print(f"saved: {output_dir}")

@@ -17,11 +17,7 @@ def safe_pearson(x, y, eps=1e-12):
 
 
 def compute_prediction_metrics(y_true, y_pred):
-    """
-    TaHiP 论文 Eq.(18)(19):
-      MSE = mean((Y_true - Y_pred)^2)
-      MAE = mean(abs(Y_true - Y_pred))
-    """
+    """SIR 的 MSE/MAE 按 0/1/2 状态编码计算，属于分类标签误差。"""
     y_true = np.asarray(y_true, dtype=np.float64)
     y_pred = np.asarray(y_pred, dtype=np.float64)
     if y_true.shape != y_pred.shape:
@@ -48,8 +44,6 @@ def hypergraph_adjacency_for_metrics(B_true_np):
     hd = B.sum(axis=1)
     A_H = B @ B.T
     A_H[np.diag_indices_from(A_H)] -= hd
-    # 数值安全
-    A_H[np.abs(A_H) < 1e-12] = 0.0
     return A_H
 
 
@@ -59,15 +53,6 @@ def compute_hd(B_true_np):
     return B.sum(axis=1)
 
 
-def compute_phd(B_hat_np):
-    """
-    PHD: 论文 Eq.(22)
-      d_hat_H(i) = sum_e B_hat[i,e]
-    """
-    B_hat = np.asarray(B_hat_np, dtype=np.float64)
-    return B_hat.sum(axis=1)
-
-
 def compute_hoh(B_true_np):
     """
     HOH: Higher-Order H-index
@@ -75,7 +60,7 @@ def compute_hoh(B_true_np):
     HOH(i) 是最大的 H，使得 i 至少有 H 个邻居的 hyperdegree >= H。
     """
     B = np.asarray(B_true_np, dtype=np.float64)
-    N, E = B.shape
+    N = B.shape[0]
     hd = compute_hd(B)
 
     # 只作为结构评价构造共享超边关系
@@ -85,9 +70,6 @@ def compute_hoh(B_true_np):
     hoh = np.zeros(N, dtype=np.float64)
     for i in range(N):
         neighbor_degrees = hd[neighbor_mask[i]]
-        if neighbor_degrees.size == 0:
-            hoh[i] = 0.0
-            continue
         vals = np.sort(neighbor_degrees)[::-1]
         ranks = np.arange(1, vals.size + 1)
         valid = ranks[vals >= ranks]
@@ -106,7 +88,7 @@ def compute_hop(
     先由 incidence matrix 得到 A_H，再构造转移矩阵 P；
     使用带 damping 的 PageRank 迭代求稳态。
 
-    damping 在论文中记为 s∈(0,1)；这里默认 0.85，并提供命令行参数修改。
+    damping 默认取 0.85。
     """
     if not (0.0 < damping < 1.0):
         raise ValueError(f"HOP damping 必须在 (0,1)，当前 {damping}")
@@ -153,23 +135,16 @@ def compute_tahip_metrics_from_phd(
         ),
     }
     names = ["HD", "PHD", "HOH", "HOP"]
+    pearson_matrix = np.empty((len(names), len(names)), dtype=np.float64)
+    for i, a in enumerate(names):
+        for j in range(i, len(names)):
+            value = safe_pearson(metrics[a], metrics[names[j]])
+            pearson_matrix[i, j] = pearson_matrix[j, i] = value
     pearson = {
-        f"{a}-{b}": safe_pearson(metrics[a], metrics[b])
-        for i, a in enumerate(names) for b in names[i + 1:]
+        f"{a}-{b}": float(pearson_matrix[i, j])
+        for i, a in enumerate(names) for j, b in enumerate(names) if i < j
     }
-    return metrics, pearson
-
-
-def compute_tahip_structure_metrics(
-    B_true_np, B_hat_np,
-    hop_damping=0.85, hop_tol=1e-12, hop_max_iter=10000,
-):
-    """保留原 SI 入口使用的关联矩阵评价接口。"""
-    if np.asarray(B_true_np).shape[0] != np.asarray(B_hat_np).shape[0]:
-        raise ValueError("真实结构与预测结构的节点数必须一致")
-    return compute_tahip_metrics_from_phd(
-        B_true_np, compute_phd(B_hat_np), hop_damping, hop_tol, hop_max_iter
-    )
+    return metrics, pearson, pearson_matrix
 
 
 def incidence_to_triplets(incidence):
@@ -203,13 +178,34 @@ def triplets_to_neighbor_rows(num_nodes, hyperedges):
     return rows
 
 
+def _binary_structure_metrics(labels, selected):
+    """一组选边结果对应的 TP/FP/FN、Precision、Recall 和 F1。"""
+    true_count = int(labels.sum())
+    selected_count = int(selected.sum())
+    tp = int(np.count_nonzero(labels & selected))
+    fp = selected_count - tp
+    fn = true_count - tp
+    return {
+        "Recovered_edges": selected_count,
+        "TP": tp,
+        "FP": fp,
+        "FN": fn,
+        "Precision": tp / max(1, selected_count),
+        "Recall": tp / max(1, true_count),
+        "F1": 2 * tp / max(1, 2 * tp + fp + fn),
+        "SHD": fp + fn,
+        "True_edges": true_count,
+    }
+
+
 def compute_neighbor_pair_structure_metrics(b_true, neighbor_pairs, row_prob):
     """三方向概率取均值，只评价 Top-E、0.5 和 0.1 三种结构。"""
     threshold = 0.5
     n = b_true.shape[0]
     pairs = np.asarray(neighbor_pairs, dtype=np.int64)
     row_prob = np.asarray(row_prob, dtype=np.float64)
-    # 只从 i < j < k 的位置收集一次候选三元组，列顺序与每行的邻居对一致。
+
+    # i 是三元组的最小编号时收集一次候选，避免重复计算同一条无向超边。
     candidates = []
     for target in range(n - 2):
         selected = pairs[target][pairs[target, :, 0] > target]
@@ -218,11 +214,9 @@ def compute_neighbor_pair_structure_metrics(b_true, neighbor_pairs, row_prob):
     targets, columns = triplet_neighbor_row_indices(n, candidates)
     directional_prob = row_prob[targets, columns]
     probability = directional_prob.mean(axis=1)
-    node_metrics, pearson, edge_metrics, recovered = compute_triplet_structure_metrics(
-        b_true, candidates, probability, threshold
-    )
 
     true_rows = triplets_to_neighbor_rows(n, incidence_to_triplets(b_true)).astype(bool)
+    labels = true_rows[targets[:, 0], columns[:, 0]]
     recovered_rows = row_prob >= threshold
     tp = int(np.count_nonzero(true_rows & recovered_rows))
     fp = int(np.count_nonzero(~true_rows & recovered_rows))
@@ -246,87 +240,46 @@ def compute_neighbor_pair_structure_metrics(b_true, neighbor_pairs, row_prob):
         )),
         "HD_row_degree_Pearson": safe_pearson(compute_hd(b_true), row_degrees),
     }
-    # Top-E 只使用真实超边数量 E 作为边数预算，选边依据仍是模型概率。
-    true_triplets = true_rows[targets[:, 0], columns[:, 0]]
-    true_count = int(true_triplets.sum())
+    # Top-E 只使用真实超边数量作为预算，选边顺序由模型概率决定。
     top_e = np.zeros(len(probability), dtype=bool)
-    top_e[np.argsort(-probability, kind="stable")[:true_count]] = True
+    top_e[np.argsort(-probability, kind="stable")[:int(labels.sum())]] = True
     selections = {
         "top_e": top_e,
-        "threshold_0_5": recovered,
+        "threshold_0_5": probability >= 0.5,
         "threshold_0_1": probability >= 0.1,
     }
-    reconstructions = {}
-    for rule, selected in selections.items():
-        selected_count = int(selected.sum())
-        hit_count = int(np.count_nonzero(true_triplets & selected))
-        false_count = selected_count - hit_count
-        missed_count = true_count - hit_count
-        reconstructions[rule] = {
+    reconstructions = {
+        rule: {
             "recovered": selected,
-            "metrics": {
-                "Recovered_edges": selected_count,
-                "TP": hit_count,
-                "FP": false_count,
-                "FN": missed_count,
-                "Precision": hit_count / max(1, selected_count),
-                "Recall": hit_count / max(1, true_count),
-                "F1": 2 * hit_count / max(1, 2 * hit_count + false_count + missed_count),
-                "SHD": false_count + missed_count,
-                "True_edges": true_count,
-            },
+            "metrics": _binary_structure_metrics(labels, selected),
         }
-
-    return {
-        "hyperedges": candidates,
-        "probabilities": probability,
-        "directional_probabilities": directional_prob,
-        "recovered": recovered,
-        "node_metrics": node_metrics,
-        "Pearson": pearson,
-        "edge_metrics": edge_metrics,
-        "row_metrics": row_metrics,
-        "row_expected_degrees": row_degrees,
-        "reconstructions": reconstructions,
+        for rule, selected in selections.items()
     }
-
-
-def compute_triplet_structure_metrics(b_true, candidates, edge_prob, threshold):
-    """在全部唯一候选三元组上评价结构，真实超边只在评价中使用。"""
-    n = b_true.shape[0]
-    candidates = np.asarray(candidates, dtype=np.int64)
-    probability = np.asarray(edge_prob, dtype=np.float64)
-    true_edges = incidence_to_triplets(b_true)
-    candidate_code = (candidates[:, 0] * n + candidates[:, 1]) * n + candidates[:, 2]
-    true_code = (true_edges[:, 0] * n + true_edges[:, 1]) * n + true_edges[:, 2]
-    labels = np.isin(candidate_code, true_code)
-    recovered = probability >= threshold
-
-    tp = int(np.count_nonzero(labels & recovered))
-    fp = int(np.count_nonzero(~labels & recovered))
-    fn = int(np.count_nonzero(labels & ~recovered))
-    precision = tp / max(1, tp + fp)
-    recall = tp / max(1, tp + fn)
+    primary = reconstructions["threshold_0_5"]
     edge_metrics = {
         "ROC_AUC": float(roc_auc_score(labels, probability)),
         "PR_AUC": float(average_precision_score(labels, probability)),
-        "Precision": precision,
-        "Recall": recall,
-        "F1": 2 * tp / max(1, 2 * tp + fp + fn),
-        "TP": tp,
-        "FP": fp,
-        "FN": fn,
-        "SHD": fp + fn,
-        "True_edges": int(labels.sum()),
-        "Recovered_edges": int(recovered.sum()),
+        **primary["metrics"],
         "Expected_edges": float(probability.sum()),
     }
 
     phd = np.zeros(n, dtype=np.float64)
     for slot in range(3):
         np.add.at(phd, candidates[:, slot], probability)
-    node_metrics, pearson = compute_tahip_metrics_from_phd(b_true, phd)
-    return node_metrics, pearson, edge_metrics, recovered
+    node_metrics, pearson, pearson_matrix = compute_tahip_metrics_from_phd(b_true, phd)
+    return {
+        "hyperedges": candidates,
+        "probabilities": probability,
+        "directional_probabilities": directional_prob,
+        "recovered": primary["recovered"],
+        "node_metrics": node_metrics,
+        "Pearson": pearson,
+        "Pearson_matrix": pearson_matrix,
+        "edge_metrics": edge_metrics,
+        "row_metrics": row_metrics,
+        "row_expected_degrees": row_degrees,
+        "reconstructions": reconstructions,
+    }
 
 
 def compute_sir_metrics(x, y_true, y_pred, y_prob, ce):

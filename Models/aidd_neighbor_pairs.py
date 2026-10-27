@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .aidd_hypergraph import NN1, NN2, NN3
+from .layers import NN1, NN2, NN3
 
 
 class GumbelNeighborPairGenerator(nn.Module):
