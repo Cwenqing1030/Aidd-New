@@ -32,6 +32,10 @@ def parse_args():
         help="动力学名称；当前训练入口支持 SIR",
     )
     parser.add_argument("--output_dir", default=None)
+    parser.add_argument(
+        "--device", default=config.DEVICE,
+        help="auto 自动选择；或指定 cpu、cuda、cuda:0、cuda:1 等设备",
+    )
     parser.add_argument("--train_ratio", type=float, default=config.TRAIN_RATIO)
     parser.add_argument("--val_ratio", type=float, default=config.VAL_RATIO)
     parser.add_argument("--epochs", type=int, default=config.EPOCHS)
@@ -111,7 +115,14 @@ def evaluate(generator, dynamics, loader, device, *, hard=False, fixed_rows=None
 
 def main():
     args = parse_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device_name = args.device
+    if device_name == "auto":
+        device_name = "cuda:0" if torch.cuda.is_available() else "cpu"
+    device = torch.device(device_name)
+    if device.type == "cuda":
+        # 同时设置当前 CUDA 设备，使默认 CUDA 操作也使用指定的卡。
+        torch.cuda.set_device(device.index if device.index is not None else 0)
+        device = torch.device("cuda", torch.cuda.current_device())
     x, y, sample_index, b_true = load_data(
         args.data_dir, args.network_name, args.dynamics_name
     )
@@ -132,6 +143,7 @@ def main():
         logdir=str(output_dir / swanlab_config.LOG_DIR_NAME),
         config={
             **vars(args),
+            "resolved_device": str(device),
             "N": n,
             "E": b_true.shape[1],
             "num_samples": len(x),
@@ -148,7 +160,8 @@ def main():
     )
     for prefix in ("train", "val", "structure"):
         swanlab.define_metric(f"{prefix}/*", x_axis="epoch")
-    swanlab.define_metric("best/*", x_axis="best_epoch")
+    swanlab.define_metric("best/*", x_axis="best_epoch", hidden=True)
+    swanlab.define_metric("best/summary", hidden=False)
     swanlab.define_metric("epoch", hidden=True)
     swanlab.define_metric("best_epoch", hidden=True)
 
@@ -456,7 +469,7 @@ def main():
     print_sir_infection_groups(infection_groups)
     print(f"\nSaved results: {output_dir.resolve()}")
 
-    # 恢复最佳权重之后只记录一次测试结果；横轴为该模型的最佳 epoch。
+    # 恢复最佳权重后记录一次；保留对比用数值，并用文本汇总最终结果。
     final_metrics = {
         "best_epoch": best_checkpoint["best_epoch"],
         "best/val_CE": best_val_ce,
@@ -470,10 +483,32 @@ def main():
     for rule, result in structure["reconstructions"].items():
         for name, value in result["metrics"].items():
             final_metrics[f"best/structure/{rule}/{name}"] = value
-    run.log(
-        {name: value for name, value in final_metrics.items() if np.isfinite(value)},
-        step=args.epochs + 1,
+    summary_lines = [
+        f"Network: {args.network_name}",
+        f"Dynamics: {args.dynamics_name}",
+        f"Best epoch: {best_checkpoint['best_epoch']}",
+    ]
+    summary_sections = {}
+    for name, value in final_metrics.items():
+        if not name.startswith("best/"):
+            continue
+        section, _, metric_name = name[len("best/"):].rpartition("/")
+        value_text = f"{value:.8g}" if np.isfinite(value) else "undefined"
+        summary_sections.setdefault(section or "selection", []).append(
+            f"{metric_name:28s} = {value_text}"
+        )
+    for section, lines in summary_sections.items():
+        summary_lines.extend(["", f"[{section}]", *lines])
+    summary_text = "\n".join(summary_lines) + "\n"
+    (output_dir / "best_summary.txt").write_text(summary_text, encoding="utf-8")
+
+    final_payload = {
+        name: value for name, value in final_metrics.items() if np.isfinite(value)
+    }
+    final_payload["best/summary"] = swanlab.Text(
+        summary_text, caption=f"Best epoch {best_checkpoint['best_epoch']}"
     )
+    run.log(final_payload, step=args.epochs + 1)
     swanlab.finish()
 
 

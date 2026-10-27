@@ -6,8 +6,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 
 # 随机三元超图与 SIR 数据
-N = 50
-E = 400
+N = 200
+E = 1600
 NUM_TRAJECTORIES = 1000
 STEPS_PER_TRAJECTORY = 5
 INITIAL_INFECTED = N // 5
@@ -23,6 +23,7 @@ DATA_DIR = ROOT / "data" / NETWORK_NAME
 OUTPUT_ROOT = ROOT / "outputs"
 
 # 训练默认值，也可以通过 train.py 的命令行参数覆盖
+DEVICE = "auto"  # auto、cpu、cuda 或 cuda:0/cuda:1 等逻辑设备编号
 TRAIN_RATIO = 0.70
 VAL_RATIO = 0.15
 EPOCHS = 10
