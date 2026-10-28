@@ -2,3 +2,5 @@ numpy
 torch
 scikit-learn
 swanlab>=0.10.0
+hypergraphx>=1.8.0
+xgi>=0.10.2

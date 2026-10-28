@@ -5,9 +5,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 
-# 随机三元超图与 SIR 数据
-N = 200
-E = 1600
+# 三元超图与 SIR 数据；拓扑类型可选 ER、SF、WS。
+NETWORK_TYPE = "WS"
+N = 50
+E = 200
+SF_ALPHA = 1.0          # 排名权重的指数；不是实际超度分布的拟合指数
+WS_REWIRE_PROB = 0.1    # 重连概率；WS 要求 E 是 N 的整数倍
 NUM_TRAJECTORIES = 1000
 STEPS_PER_TRAJECTORY = 5
 INITIAL_INFECTED = N // 5
@@ -15,9 +18,18 @@ BETA = 0.5
 GAMMA = 0.5
 SEED = 42
 
-# 固定 E 条超边的 ER 三元超图：G^(3)(N,E)。
 # 网络文件共用一个目录，动力学名称进入各自的数据文件名。
-NETWORK_NAME = f"ER3_N{N}_E{E}_seed{SEED}"
+NETWORK_PARAMETERS = {
+    "ER": {},
+    "SF": {"alpha": SF_ALPHA},
+    "WS": {"rewire_prob": WS_REWIRE_PROB},
+}[NETWORK_TYPE]
+_network_suffix = {
+    "ER": "",
+    "SF": f"_alpha{SF_ALPHA:g}",
+    "WS": f"_p{WS_REWIRE_PROB:g}",
+}[NETWORK_TYPE]
+NETWORK_NAME = f"{NETWORK_TYPE}3_N{N}_E{E}{_network_suffix}_seed{SEED}"
 DYNAMICS_NAME = "SIR"
 DATA_DIR = ROOT / "data" / NETWORK_NAME
 OUTPUT_ROOT = ROOT / "outputs"

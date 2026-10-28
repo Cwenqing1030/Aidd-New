@@ -1,10 +1,9 @@
-"""在固定三元超图上生成固定长度的 SIR 轨迹。0=S，1=I，2=R。
+"""在 ER、SF 或 WS 三元超图上生成固定长度的 SIR 轨迹。0=S，1=I，2=R。
 
 每行 X=s(t)、Y=s(t+1)。index 两列为从 0 开始的轨迹编号、时间步。
 同一轨迹内 Y[k]=X[k+1]；划分训练集和测试集时按轨迹编号分组。
 """
 
-from math import comb
 from pathlib import Path
 import json
 import sys
@@ -16,18 +15,15 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from config import (
     N, E, NUM_TRAJECTORIES, STEPS_PER_TRAJECTORY, INITIAL_INFECTED,
-    BETA, GAMMA, SEED, DATA_DIR, NETWORK_NAME,
+    BETA, GAMMA, SEED, DATA_DIR, NETWORK_NAME, NETWORK_TYPE, NETWORK_PARAMETERS,
 )
+from data.hypergraphs import generate_hyperedges
 
 
 def generate_hypergraph(rng):
-    if N < 3 or not 1 <= E <= comb(N, 3):
-        raise ValueError("三元超图要求 N >= 3，且 1 <= E <= C(N,3)")
-    hyperedges = set()
-    while len(hyperedges) < E:
-        hyperedges.add(tuple(sorted(rng.choice(N, 3, replace=False).tolist())))
-
-    hyperedges = np.array(sorted(hyperedges), dtype=np.int64)
+    hyperedges = generate_hyperedges(
+        NETWORK_TYPE, N, E, rng, **NETWORK_PARAMETERS
+    )
     incidence = np.zeros((N, E), dtype=np.int64)
     incidence[hyperedges, np.arange(E)[:, None]] = 1
     return hyperedges, incidence
@@ -82,10 +78,16 @@ def generate_data():
 
     parameters = {
         "network_name": NETWORK_NAME,
-        "network_type": "ER",
-        "network_ensemble": "G^(3)(N,E)",
+        "network_type": NETWORK_TYPE,
+        "network_parameters": NETWORK_PARAMETERS,
+        "network_ensemble": {
+            "ER": "G^(3)(N,E)",
+            "SF": "hypergraphx.scale_free_hypergraph",
+            "WS": "xgi.ring_lattice_with_simple_3_uniform_rewiring",
+        }[NETWORK_TYPE],
         "dynamics_name": "SIR",
         "N": N, "E": E, "hyperedge_size": 3,
+        "mean_hyperdegree": 3 * E / N,
         "num_trajectories": NUM_TRAJECTORIES, "num_samples": len(x),
         "steps_per_trajectory": STEPS_PER_TRAJECTORY,
         "initial_infected": INITIAL_INFECTED, "beta": BETA, "gamma": GAMMA,
@@ -104,6 +106,7 @@ def generate_data():
         json.dumps(parameters, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     print(f"saved: {output_dir}")
+    print(f"network: {NETWORK_NAME}; type: {NETWORK_TYPE}; parameters: {NETWORK_PARAMETERS}")
     print(f"hyperedges: {hyperedges.shape}; incidence: {incidence.shape}")
     print(f"trajectories: {NUM_TRAJECTORIES}; steps per trajectory: {STEPS_PER_TRAJECTORY}; X: {x.shape}; Y: {y.shape}")
     print("index columns: trajectory_id, time_step (zero-based); states: 0=S, 1=I, 2=R")

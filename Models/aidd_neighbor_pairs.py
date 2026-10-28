@@ -1,4 +1,4 @@
-"""AIDD 的逐节点流程：每个目标节点对应一行候选邻居对。"""
+"""AIDD 逐节点流程：候选邻居对共享无向三元超边参数。"""
 
 import math
 
@@ -11,9 +11,9 @@ from .layers import NN1, NN2, NN3
 
 class GumbelNeighborPairGenerator(nn.Module):
     """
-    N 行候选邻居对 logits，每行形状为 [C(N-1, 2), 2]。
+    每条无向三元超边只保存一组 logits，形状为 [C(N, 3), 2]。
     第 0 类表示有边，第 1 类表示无边。
-    每行单独作为 Parameter，Adam 只更新当前参与损失的行。
+    N 行候选邻居对通过索引读取共享参数，三个节点的损失更新同一条边。
     """
 
     def __init__(
@@ -24,31 +24,56 @@ class GumbelNeighborPairGenerator(nn.Module):
             raise ValueError("init_edge_prob 必须在 (0,1) 内")
         self.N = num_nodes
         self.num_pairs = (num_nodes - 1) * (num_nodes - 2) // 2
+        self.num_hyperedges = math.comb(num_nodes, 3)
         self.temperature = temperature
+
+        local_pairs = torch.combinations(torch.arange(num_nodes - 1), r=2)
+        row_indices = []
+        for target_i in range(num_nodes):
+            neighbors = local_pairs + (local_pairs >= target_i)
+            targets = torch.full((self.num_pairs, 1), target_i, dtype=torch.long)
+            triples = torch.cat((targets, neighbors), dim=1).sort(dim=1).values
+            a, b, c = triples.unbind(dim=1)
+            # 排序后的 {a,b,c} 用 a+C(b,2)+C(c,3) 唯一编号，与目标节点无关。
+            row_indices.append(a + b * (b - 1) // 2 + c * (c - 1) * (c - 2) // 6)
+        self.register_buffer("row_to_hyperedge", torch.stack(row_indices))
+
         base_logits = torch.tensor(
             [math.log(init_edge_prob), math.log1p(-init_edge_prob)]
         )
-        self.gen_matrix = nn.ParameterList([
-            nn.Parameter(
-                base_logits.expand(self.num_pairs, 2).clone()
-                + init_std * torch.randn(self.num_pairs, 2)
-            )
-            for _ in range(num_nodes)
-        ])
+        initial_logits = (
+            base_logits.expand(self.num_hyperedges, 2).clone()
+            + init_std * torch.randn(self.num_hyperedges, 2)
+        )
+        # 这里只用 Embedding 保存和索引边参数；稀疏梯度配合 SparseAdam，
+        # 使逐节点优化只更新当前节点关联的候选超边。
+        self.gen_matrix = nn.Embedding.from_pretrained(
+            initial_logits, freeze=False, sparse=True
+        )
 
     def sample_adj_row(self, target_i, hard=False):
-        """只采样目标节点 i 的一行邻居对，返回 [C(N-1,2)]。"""
+        """训练时读取共享参数，采样目标 i 的一行，再进行本次逐节点更新。"""
+        logits = self.gen_matrix(self.row_to_hyperedge[target_i])
         return F.gumbel_softmax(
-            self.gen_matrix[target_i], tau=self.temperature, hard=hard, dim=-1
+            logits, tau=self.temperature, hard=hard, dim=-1
         )[:, 0]
+
+    @torch.no_grad()
+    def sample_adj_matrix(self, hard=False):
+        """评价时每条候选超边只采样一次，三个节点视角使用相同取值。"""
+        sampled_edges = F.gumbel_softmax(
+            self.gen_matrix.weight, tau=self.temperature, hard=hard, dim=-1
+        )[:, 0]
+        return sampled_edges[self.row_to_hyperedge]
 
     def row_probabilities(self, target_i):
         """当前行的 Bernoulli 有边概率，用于期望超度惩罚。"""
-        return self.gen_matrix[target_i].softmax(dim=-1)[:, 0]
+        return self.gen_matrix(self.row_to_hyperedge[target_i]).softmax(dim=-1)[:, 0]
 
     def edge_probabilities(self):
-        """按原行顺序返回 [N,Q] 概率矩阵，用于结构评价和保存。"""
-        return torch.stack([self.row_probabilities(i) for i in range(self.N)])
+        """展开为 [N,Q] 概率矩阵；同一超边在三个位置的概率完全相同。"""
+        probabilities = self.gen_matrix.weight.softmax(dim=-1)[:, 0]
+        return probabilities[self.row_to_hyperedge]
 
 
 class AIDDNeighborPairDynamics(nn.Module):

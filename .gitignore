@@ -5,3 +5,5 @@ README.md
 uv.lock
 data/hypergraph_*/
 data/ER3_*/
+data/SF3_*/
+data/WS3_*/

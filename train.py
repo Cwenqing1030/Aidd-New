@@ -1,4 +1,4 @@
-"""AIDD 逐节点训练：目标节点 × 候选邻居对，SIR 状态保留 0/1/2。"""
+"""共享无向三元超边参数的 AIDD 逐节点训练，SIR 状态保留 0/1/2。"""
 
 import argparse
 import csv
@@ -74,7 +74,7 @@ def parse_args():
 
 @torch.no_grad()
 def evaluate(generator, dynamics, loader, device, *, hard=False, fixed_rows=None, seed=42):
-    """沿用逐节点采样评价；fixed_rows 用于固定真实结构或导出的二值超图。"""
+    """逐节点预测共享采样超图；fixed_rows 用于固定真实结构或导出的二值超图。"""
     dynamics.eval()
     if generator is not None:
         generator.eval()
@@ -93,11 +93,12 @@ def evaluate(generator, dynamics, loader, device, *, hard=False, fixed_rows=None
             probabilities = x_batch.new_empty(
                 x_batch.shape[0], dynamics.N, dynamics.num_states
             )
+            sampled_rows = (
+                generator.sample_adj_matrix(hard=hard)
+                if fixed_rows is None else fixed_rows
+            )
             for target_i in range(dynamics.N):
-                if fixed_rows is None:
-                    adj_row = generator.sample_adj_row(target_i, hard=hard)
-                else:
-                    adj_row = fixed_rows[target_i]
+                adj_row = sampled_rows[target_i]
                 log_probability = dynamics(x_batch, adj_row, target_i)
                 total_ce += F.nll_loss(
                     log_probability, y_batch[:, target_i], reduction="sum"
@@ -148,6 +149,10 @@ def main():
             "E": b_true.shape[1],
             "num_samples": len(x),
             "num_pairs_per_node": (n - 1) * (n - 2) // 2,
+            "num_hyperedge_candidates": n * (n - 1) * (n - 2) // 6,
+            "structure_mode": "shared_undirected_triplets",
+            "structure_optimizer": "SparseAdam",
+            "evaluation_sampling": "one_shared_hypergraph_per_batch",
             "train_trajectories": len(groups["train"]),
             "val_trajectories": len(groups["val"]),
             "test_trajectories": len(groups["test"]),
@@ -190,7 +195,9 @@ def main():
         init_edge_prob=args.init_edge_prob, init_std=args.init_std
     ).to(device)
     optimizer_dyn = torch.optim.Adam(dynamics.parameters(), lr=args.lr_dyn)
-    optimizer_structure = torch.optim.Adam(generator.parameters(), lr=args.lr_structure)
+    optimizer_structure = torch.optim.SparseAdam(
+        generator.parameters(), lr=args.lr_structure
+    )
     neighbor_pairs = dynamics.neighbor_pairs.detach().cpu().numpy()
 
     print(f"script: {Path(__file__).resolve()}")
@@ -199,7 +206,8 @@ def main():
     print(f"network: {args.network_name}; dynamics: {args.dynamics_name}")
     print(f"device: {device}; neighbor matrix={n} x {generator.num_pairs}")
     print("states: 0=S, 1=I, 2=R; NN1 input=[x_j(t), x_k(t), x_i(t)]")
-    print("structure: independent target rows; class 0=edge, class 1=no-edge")
+    print("structure: shared undirected triplets; class 0=edge, class 1=no-edge")
+    print(f"unique structure candidates: {generator.num_hyperedges}")
     print("structure evaluation: Top-E, threshold=0.5, threshold=0.1; primary export=0.5")
     print(
         f"AIDD settings: batch={args.batch_size}; temperature={args.temperature}; "
@@ -208,7 +216,7 @@ def main():
     )
     print(f"base expected row degree: {generator.num_pairs * args.init_edge_prob:.4f}")
     print(f"prediction updates per target row per epoch: {len(train_loader)}")
-    print("updates: sample one row -> CE + sparsity -> backward -> update active row and dynamics")
+    print("updates: sample target row -> CE + sparsity -> update incident shared edges and dynamics")
     print(
         f"sparsity: {args.lambda_sparse} * expected degree of the active row; "
         "prediction and sparsity share one backward pass"
@@ -231,7 +239,7 @@ def main():
         ce_sum, degree_sum, sample_count = 0.0, 0.0, 0
         for x_batch, y_batch in train_loader:
             x_batch, y_batch = x_batch.to(device), y_batch.to(device)
-            # 每行的预测损失和期望超度惩罚一起反传，只更新当前行。
+            # 逐节点反传；三个成员的损失共同更新同一份无向超边参数。
             for target_i in range(n):
                 optimizer_structure.zero_grad(set_to_none=True)
                 optimizer_dyn.zero_grad(set_to_none=True)
@@ -290,11 +298,14 @@ def main():
                 },
                 "swanlab_run_id": run.id,
                 "architecture": "aidd_neighbor_pairs",
-                "structure_mode": "independent_target_rows",
+                "structure_mode": "shared_undirected_triplets",
                 "training_objective": "node_CE + lambda_sparse * expected_row_degree",
-                "structure_parameters": "separate_parameter_per_target_row",
+                "structure_parameters": "one_logit_pair_per_undirected_triplet",
+                "structure_optimizer": "SparseAdam",
+                "evaluation_sampling": "one_shared_hypergraph_per_batch",
                 "args": vars(args).copy(),
                 "N": n, "num_pairs": generator.num_pairs,
+                "num_hyperedge_candidates": generator.num_hyperedges,
                 "F_dim": args.F_dim, "num_classes": 3,
                 "temperature": generator.temperature,
                 "best_epoch": epoch + 1, "val_CE": val_ce,
@@ -315,6 +326,7 @@ def main():
             "structure/expected_row_entries": expected_row_entries,
             "structure/recovered_row_entries_0_5": recovered_row_entries,
             "structure/HD_PHD_Pearson": epoch_structure["Pearson"]["HD-PHD"],
+            "structure/Triplet_view_disagreement": epoch_structure["row_metrics"]["Direction_disagreement"],
         }
         for rule, result in epoch_structure["reconstructions"].items():
             for name in ("Precision", "Recall", "F1", "Recovered_edges"):
@@ -387,7 +399,7 @@ def main():
     metric_matrix = np.column_stack([node_metrics[name] for name in metric_names])
     pearson_matrix = structure["Pearson_matrix"]
 
-    # 行矩阵原样保存。三个独立方向可能不同，不能把原始行阈值矩阵当作无向超图。
+    # 行矩阵是共享无向超边参数的展开，同一超边的三个位置取值一致。
     np.savez_compressed(
         output_dir / "neighbor_pair_matrix.npz",
         neighbor_pairs=neighbor_pairs.astype(np.int32),
@@ -395,7 +407,7 @@ def main():
         row_thresholded=(row_probability >= 0.5).astype(np.uint8),
         row_threshold=np.float32(0.5),
     )
-    # 无向超边分数取三个方向的概率均值，同时保留三个原始方向分数。
+    # 保留原导出布局；同一超边的三个节点视角现在具有相同概率。
     np.savez_compressed(
         output_dir / "hyperedge_probabilities.npz",
         hyperedges=structure["hyperedges"].astype(np.int32),
@@ -475,6 +487,7 @@ def main():
         "best/val_CE": best_val_ce,
         **{f"best/test/sampled_rows/{name}": value for name, value in test_metrics.items()},
         **{f"best/structure/{name}": value for name, value in structure["edge_metrics"].items()},
+        "best/structure/Triplet_view_disagreement": structure["row_metrics"]["Direction_disagreement"],
         **{f"best/Pearson/{name}": value for name, value in pearson.items()},
     }
     for rule, values in recovered_metrics_by_rule.items():
