@@ -330,3 +330,37 @@ def print_sir_infection_groups(rows):
     print("active_edges  count  actual_infection_rate  mean_predicted_infection_prob")
     for count, samples, actual, predicted in rows:
         print(f"{int(count):12d}  {int(samples):5d}  {actual:21.8f}  {predicted:29.8f}")
+
+
+def compute_voter_metrics(x, y_true, y_pred, y_prob, ce):
+    mse, mae = compute_prediction_metrics(y_true, y_pred)
+    changed = y_true != x
+    return {
+        "CE": ce, "MSE": mse, "MAE": mae,
+        "Accuracy": float(np.mean(y_true == y_pred)),
+        "Brier": float(np.mean((y_prob[..., 1] - y_true) ** 2)),
+        "Persistence_accuracy": float(np.mean(x == y_true)),
+        "Changed_node_accuracy": (
+            float(np.mean(y_pred[changed] == y_true[changed]))
+            if changed.any() else float("nan")
+        ),
+    }
+
+
+def compute_continuous_metrics(x, y_true, y_pred, y_prob, normalized_delta_mse):
+    """连续状态用数值误差；归一化尺度仅由训练集的一步增量计算。"""
+    mse, mae = compute_prediction_metrics(y_true, y_pred)
+    persistence_mse = float(np.mean((y_true - x) ** 2))
+    values = {
+        "normalized_delta_MSE": normalized_delta_mse,
+        "MSE": mse, "MAE": mae, "RMSE": float(np.sqrt(mse)),
+        "Persistence_MSE": persistence_mse,
+        "Improvement_over_persistence": (
+            1 - mse / persistence_mse if persistence_mse > 0 else float("nan")
+        ),
+    }
+    for channel in range(y_true.shape[-1]):
+        values[f"MSE_channel_{channel}"] = float(
+            np.mean((y_true[..., channel] - y_pred[..., channel]) ** 2)
+        )
+    return values

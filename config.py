@@ -6,9 +6,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 
 # 三元超图与 SIR 数据；拓扑类型可选 ER、SF、WS。
-NETWORK_TYPE = "WS"
-N = 50
-E = 200
+NETWORK_TYPE = "SF"
+N = 100
+E = 400
 SF_ALPHA = 1.0          # 排名权重的指数；不是实际超度分布的拟合指数
 WS_REWIRE_PROB = 0.1    # 重连概率；WS 要求 E 是 N 的整数倍
 NUM_TRAJECTORIES = 1000
@@ -49,3 +49,17 @@ TEMPERATURE = 1.0
 INIT_EDGE_PROB = 0.001
 INIT_STD = 0.1
 GUMBEL_HARD = False
+
+# 新增动力学：参数由 data/generate_dynamics.py 读取，SIR 的 BETA/GAMMA 沿用上方设置。
+GENERATION_BATCH_SIZE = 32
+DYNAMICS_PARAMETERS = {
+    "Voter": {"initial_probability": 0.5},
+    "Kuramoto": {
+        "coupling": 0.2, "frequency": 1.0,
+        "internal_dt": 0.01, "microsteps": 10,
+    },
+    "Spring": {
+        "strength": 0.1, "location_std": 0.5, "velocity_norm": 0.5,
+        "internal_dt": 0.001, "microsteps": 100,
+    },
+}

@@ -1,4 +1,4 @@
-"""共享无向三元超边参数的 AIDD 逐节点训练，SIR 状态保留 0/1/2。"""
+"""三元超图的联合结构/动力学训练；支持 SIR、Voter、Kuramoto、Spring。"""
 
 import argparse
 import csv
@@ -10,13 +10,18 @@ import torch
 import torch.nn.functional as F
 import config
 import swanlab_config
-from data.dataset import load_data, make_loader, split_trajectories
+from data.dataset import DYNAMICS_SPECS, load_data, make_loader, split_trajectories
 
-from Models import AIDDNeighborPairDynamics, GumbelNeighborPairGenerator
+from Models import (
+    AIDDNeighborPairDynamics, AIDDContinuousNeighborPairDynamics,
+    GumbelNeighborPairGenerator,
+)
 from metrics import (
     compute_neighbor_pair_structure_metrics,
     compute_sir_infection_groups,
     compute_sir_metrics,
+    compute_voter_metrics,
+    compute_continuous_metrics,
     incidence_to_triplets,
     print_sir_infection_groups,
     triplets_to_neighbor_rows,
@@ -28,8 +33,8 @@ def parse_args():
     parser.add_argument("--data_dir", default=str(config.DATA_DIR))
     parser.add_argument("--network_name", default=None)
     parser.add_argument(
-        "--dynamics_name", default=config.DYNAMICS_NAME, choices=("SIR",),
-        help="动力学名称；当前训练入口支持 SIR",
+        "--dynamics_name", default=config.DYNAMICS_NAME, choices=tuple(DYNAMICS_SPECS),
+        help="SIR/Voter 使用分类；Kuramoto/Spring 使用连续数值预测",
     )
     parser.add_argument("--output_dir", default=None)
     parser.add_argument(
@@ -51,6 +56,8 @@ def parse_args():
     parser.add_argument("--gumbel_hard", action="store_true", default=config.GUMBEL_HARD)
     parser.add_argument("--seed", type=int, default=config.SEED)
     args = parser.parse_args()
+    # 相对数据路径和输出路径均以源码根目录为基准。
+    args.data_dir = str((config.ROOT / args.data_dir).resolve())
     if args.network_name is None:
         args.network_name = Path(args.data_dir).name
     if args.output_dir is None:
@@ -58,6 +65,7 @@ def parse_args():
             config.OUTPUT_ROOT / args.network_name
             / f"{args.dynamics_name}_train_seed{args.seed}"
         )
+    args.output_dir = str((config.ROOT / args.output_dir).resolve())
     if not (0 < args.train_ratio < 1 and 0 < args.val_ratio < 1
             and args.train_ratio + args.val_ratio < 1):
         parser.error("train_ratio、val_ratio 必须为正，且两者之和小于 1")
@@ -114,8 +122,55 @@ def evaluate(generator, dynamics, loader, device, *, hard=False, fixed_rows=None
     )
 
 
+@torch.no_grad()
+def evaluate_continuous(
+    generator, dynamics, loader, device, *, hard=False, fixed_rows=None, seed=42,
+):
+    dynamics.eval()
+    if generator is not None:
+        generator.eval()
+    cuda_devices = [device.index] if device.type == "cuda" else []
+    true_batches, pred_batches = [], []
+    total_loss = 0.0
+    with torch.random.fork_rng(devices=cuda_devices):
+        torch.manual_seed(seed)
+        for x_batch, y_batch in loader:
+            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+            predictions = torch.empty_like(y_batch)
+            sampled_rows = (
+                generator.sample_adj_matrix(hard=hard)
+                if fixed_rows is None else fixed_rows
+            )
+            for target_i in range(dynamics.N):
+                prediction = dynamics(x_batch, sampled_rows[target_i], target_i)
+                total_loss += dynamics.prediction_loss(
+                    prediction, y_batch[:, target_i], reduction="sum",
+                ).item()
+                predictions[:, target_i] = prediction
+            true_batches.append(y_batch.cpu().numpy())
+            pred_batches.append(predictions.cpu().numpy())
+    y_true = np.concatenate(true_batches)
+    return total_loss / y_true.size, y_true, np.concatenate(pred_batches), None
+
+
+def save_prediction_array(output_dir, name, values):
+    """标量离散状态保留 TXT；多通道连续状态使用 NPY 保留维度。"""
+    if values.ndim == 2:
+        np.savetxt(output_dir / f"{name}.txt", values, fmt="%d")
+    else:
+        np.save(output_dir / f"{name}.npy", values)
+
+
 def main():
     args = parse_args()
+    spec = DYNAMICS_SPECS[args.dynamics_name]
+    is_discrete = spec["kind"] == "discrete"
+    loss_name = "CE" if is_discrete else "normalized_delta_MSE"
+    evaluate_dynamics = evaluate if is_discrete else evaluate_continuous
+    prediction_metrics = {
+        "SIR": compute_sir_metrics, "Voter": compute_voter_metrics,
+        "Kuramoto": compute_continuous_metrics, "Spring": compute_continuous_metrics,
+    }[args.dynamics_name]
     device_name = args.device
     if device_name == "auto":
         device_name = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -131,6 +186,12 @@ def main():
     rows, groups = split_trajectories(
         sample_index, args.train_ratio, args.val_ratio, args.seed
     )
+    delta_scale = None
+    if not is_discrete:
+        # 每个通道共用全体训练节点的增量尺度；不使用验证/测试样本。
+        delta_scale = np.maximum(
+            (y[rows["train"]] - x[rows["train"]]).std(axis=(0, 1)), 1e-6,
+        )
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     n = x.shape[1]
@@ -159,7 +220,11 @@ def main():
             "train_samples": len(rows["train"]),
             "val_samples": len(rows["val"]),
             "test_samples": len(rows["test"]),
-            "state_encoding": {"S": 0, "I": 1, "R": 2},
+            "state_encoding": spec["state_encoding"],
+            "state_dim": spec["state_dim"],
+            "prediction_loss": loss_name,
+            "training_mode": "joint",
+            "delta_scale": None if is_discrete else delta_scale.tolist(),
             "structure_rules": ["top_e", "threshold_0_5", "threshold_0_1"],
         },
     )
@@ -174,12 +239,6 @@ def main():
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
-    np.savez(
-        output_dir / "split_indices.npz",
-        train_rows=rows["train"], val_rows=rows["val"], test_rows=rows["test"],
-        train_trajectories=groups["train"], val_trajectories=groups["val"],
-        test_trajectories=groups["test"],
-    )
     data_generator = torch.Generator().manual_seed(args.seed)
     train_loader = make_loader(
         x, y, rows["train"], args.batch_size, shuffle=True, generator=data_generator
@@ -187,9 +246,16 @@ def main():
     val_loader = make_loader(x, y, rows["val"], args.batch_size)
     test_loader = make_loader(x, y, rows["test"], args.batch_size)
     # 先初始化动力学网络，固定结构对照可用同一个 seed 得到相同的初始权重。
-    dynamics = AIDDNeighborPairDynamics(
-        n, feature_dim=args.F_dim, pair_chunk_size=args.pair_chunk_size
-    ).to(device)
+    if is_discrete:
+        dynamics = AIDDNeighborPairDynamics(
+            n, feature_dim=args.F_dim, num_states=spec["num_states"],
+            pair_chunk_size=args.pair_chunk_size,
+        ).to(device)
+    else:
+        dynamics = AIDDContinuousNeighborPairDynamics(
+            n, state_dim=spec["state_dim"], delta_scale=delta_scale,
+            feature_dim=args.F_dim, pair_chunk_size=args.pair_chunk_size,
+        ).to(device)
     generator = GumbelNeighborPairGenerator(
         n, temperature=args.temperature,
         init_edge_prob=args.init_edge_prob, init_std=args.init_std
@@ -198,14 +264,16 @@ def main():
     optimizer_structure = torch.optim.SparseAdam(
         generator.parameters(), lr=args.lr_structure
     )
+    criterion = F.nll_loss if is_discrete else dynamics.prediction_loss
     neighbor_pairs = dynamics.neighbor_pairs.detach().cpu().numpy()
 
     print(f"script: {Path(__file__).resolve()}")
     print(f"data: {Path(args.data_dir).resolve()}")
     print(f"output: {output_dir.resolve()}")
     print(f"network: {args.network_name}; dynamics: {args.dynamics_name}")
+    print(f"seed: {args.seed}")
     print(f"device: {device}; neighbor matrix={n} x {generator.num_pairs}")
-    print("states: 0=S, 1=I, 2=R; NN1 input=[x_j(t), x_k(t), x_i(t)]")
+    print(f"state encoding: {spec['state_encoding']}; NN1 input=[x_j(t), x_k(t), x_i(t)]")
     print("structure: shared undirected triplets; class 0=edge, class 1=no-edge")
     print(f"unique structure candidates: {generator.num_hyperedges}")
     print("structure evaluation: Top-E, threshold=0.5, threshold=0.1; primary export=0.5")
@@ -216,7 +284,7 @@ def main():
     )
     print(f"base expected row degree: {generator.num_pairs * args.init_edge_prob:.4f}")
     print(f"prediction updates per target row per epoch: {len(train_loader)}")
-    print("updates: sample target row -> CE + sparsity -> update incident shared edges and dynamics")
+    print(f"updates: sample target row -> {loss_name} + sparsity -> update shared edges and dynamics")
     print(
         f"sparsity: {args.lambda_sparse} * expected degree of the active row; "
         "prediction and sparsity share one backward pass"
@@ -230,7 +298,7 @@ def main():
     history_path = output_dir / "training_history.csv"
     with history_path.open("w", newline="", encoding="utf-8") as history_file:
         csv.writer(history_file).writerow([
-            "epoch", "train_CE", "train_sparse", "train_total_loss", "val_CE",
+            "epoch", f"train_{loss_name}", "train_sparse", "train_total_loss", f"val_{loss_name}",
             "expected_row_entries", "recovered_row_entries", "updates_per_row",
         ])
     for epoch in range(args.epochs):
@@ -245,7 +313,7 @@ def main():
                 optimizer_dyn.zero_grad(set_to_none=True)
                 adj_row = generator.sample_adj_row(target_i, hard=args.gumbel_hard)
                 log_probability = dynamics(x_batch, adj_row, target_i)
-                prediction_loss = F.nll_loss(log_probability, y_batch[:, target_i])
+                prediction_loss = criterion(log_probability, y_batch[:, target_i])
                 expected_degree = generator.row_probabilities(target_i).sum()
                 # 对所有目标取平均后，稀疏项对应平均期望超度，而非整张矩阵之和。
                 sparse_loss = args.lambda_sparse * expected_degree
@@ -258,11 +326,11 @@ def main():
                 degree_sum += expected_degree.detach().item() * x_batch.shape[0]
                 sample_count += x_batch.shape[0]
 
-        val_ce, val_true, val_pred, val_prob = evaluate(
+        val_ce, val_true, val_pred, val_prob = evaluate_dynamics(
             generator, dynamics, val_loader, device,
             hard=args.gumbel_hard, seed=args.seed,
         )
-        val_metrics = compute_sir_metrics(
+        val_metrics = prediction_metrics(
             x[rows["val"]], val_true, val_pred, val_prob, val_ce
         )
         with torch.no_grad():
@@ -281,8 +349,8 @@ def main():
             ])
         print(
             f"Epoch {epoch + 1:03d}/{args.epochs} | "
-            f"train_CE={train_ce:.8f} | train_sparse={train_sparse:.8f} | "
-            f"val_CE={val_ce:.8f} | expected_row_entries={expected_row_entries:.2f} | "
+            f"train_{loss_name}={train_ce:.8f} | train_sparse={train_sparse:.8f} | "
+            f"val_{loss_name}={val_ce:.8f} | expected_row_entries={expected_row_entries:.2f} | "
             f"recovered_row_entries={recovered_row_entries}"
         )
         if val_ce < best_val_ce:
@@ -297,29 +365,33 @@ def main():
                     for name, value in dynamics.state_dict().items()
                 },
                 "swanlab_run_id": run.id,
-                "architecture": "aidd_neighbor_pairs",
+                "architecture": (
+                    "aidd_neighbor_pairs" if is_discrete else "aidd_continuous_neighbor_pairs"
+                ),
                 "structure_mode": "shared_undirected_triplets",
-                "training_objective": "node_CE + lambda_sparse * expected_row_degree",
+                "training_mode": "joint",
+                "training_objective": f"node_{loss_name} + lambda_sparse * expected_row_degree",
                 "structure_parameters": "one_logit_pair_per_undirected_triplet",
                 "structure_optimizer": "SparseAdam",
                 "evaluation_sampling": "one_shared_hypergraph_per_batch",
                 "args": vars(args).copy(),
                 "N": n, "num_pairs": generator.num_pairs,
                 "num_hyperedge_candidates": generator.num_hyperedges,
-                "F_dim": args.F_dim, "num_classes": 3,
+                "F_dim": args.F_dim, "num_classes": spec["num_states"],
+                "state_dim": spec["state_dim"],
                 "temperature": generator.temperature,
-                "best_epoch": epoch + 1, "val_CE": val_ce,
+                "best_epoch": epoch + 1, f"val_{loss_name}": val_ce,
             }
             torch.save(best_checkpoint, checkpoint_path)
 
-        # 一个 epoch 汇总一次；真实结构指标只作监控，选模仍只依据 val_CE。
+        # 一个 epoch 汇总一次；真实结构指标只作监控，选模依据验证预测损失。
         epoch_metrics = {
             "epoch": epoch + 1,
-            "train/CE": train_ce,
+            f"train/{loss_name}": train_ce,
             "train/sparsity": train_sparse,
             "train/total_loss": train_ce + train_sparse,
             **{f"val/{name}": value for name, value in val_metrics.items()},
-            "val/best_CE": best_val_ce,
+            f"val/best_{loss_name}": best_val_ce,
             "structure/ROC_AUC": epoch_structure["edge_metrics"]["ROC_AUC"],
             "structure/PR_AUC": epoch_structure["edge_metrics"]["PR_AUC"],
             "structure/Expected_edges": epoch_structure["edge_metrics"]["Expected_edges"],
@@ -343,11 +415,11 @@ def main():
     generator.load_state_dict(best_checkpoint["generator_state_dict"])
     generator.temperature = best_checkpoint["temperature"]
     dynamics.load_state_dict(best_checkpoint["dynamics_state_dict"])
-    test_ce, y_true, y_pred, y_prob = evaluate(
+    test_ce, y_true, y_pred, y_prob = evaluate_dynamics(
         generator, dynamics, test_loader, device,
         hard=args.gumbel_hard, seed=args.seed,
     )
-    test_metrics = compute_sir_metrics(
+    test_metrics = prediction_metrics(
         x[rows["test"]], y_true, y_pred, y_prob, test_ce
     )
     row_probability = generator.edge_probabilities().detach().cpu().numpy()
@@ -369,11 +441,11 @@ def main():
     for rule, result in structure["reconstructions"].items():
         recovered_hyperedges = structure["hyperedges"][result["recovered"]]
         recovered_rows = triplets_to_neighbor_rows(n, recovered_hyperedges)
-        recovered_ce, recovered_true, recovered_pred, recovered_prob = evaluate(
+        recovered_ce, recovered_true, recovered_pred, recovered_prob = evaluate_dynamics(
             None, dynamics, test_loader, device,
             fixed_rows=torch.from_numpy(recovered_rows).to(device), seed=args.seed,
         )
-        recovered_metrics_by_rule[rule] = compute_sir_metrics(
+        recovered_metrics_by_rule[rule] = prediction_metrics(
             x[rows["test"]], recovered_true, recovered_pred, recovered_prob, recovered_ce
         )
         suffix = export_suffixes[rule]
@@ -381,19 +453,20 @@ def main():
             output_dir / f"recovered_hyperedges{suffix}.txt", recovered_hyperedges, fmt="%d"
         )
         np.save(output_dir / f"recovered_neighbor_matrix{suffix}.npy", recovered_rows)
-        np.savetxt(
-            output_dir / f"Y_pred_recovered{suffix}.txt", recovered_pred, fmt="%d"
-        )
-        np.save(output_dir / f"Y_prob_recovered{suffix}.npy", recovered_prob)
+        save_prediction_array(output_dir, f"Y_pred_recovered{suffix}", recovered_pred)
+        if recovered_prob is not None:
+            np.save(output_dir / f"Y_prob_recovered{suffix}.npy", recovered_prob)
         values = result["metrics"]
         structure_lines.append(
             f"{rule_labels[rule]} {values['Recovered_edges']} {values['TP']} "
             f"{values['FP']} {values['FN']} {values['Precision']:.8f} "
             f"{values['Recall']:.8f} {values['F1']:.8f}"
         )
-    infection_groups = compute_sir_infection_groups(
-        x[rows["test"]], y_true, y_prob, b_true
-    )
+    infection_groups = None
+    if args.dynamics_name == "SIR":
+        infection_groups = compute_sir_infection_groups(
+            x[rows["test"]], y_true, y_prob, b_true
+        )
     node_metrics, pearson = structure["node_metrics"], structure["Pearson"]
     metric_names = ["HD", "PHD", "HOH", "HOP"]
     metric_matrix = np.column_stack([node_metrics[name] for name in metric_names])
@@ -414,9 +487,10 @@ def main():
         probabilities=structure["probabilities"].astype(np.float32),
         directional_probabilities=structure["directional_probabilities"].astype(np.float32),
     )
-    np.savetxt(output_dir / "Y_true_test.txt", y_true, fmt="%d")
-    np.savetxt(output_dir / "Y_pred_final.txt", y_pred, fmt="%d")
-    np.save(output_dir / "Y_prob_test.npy", y_prob)
+    save_prediction_array(output_dir, "Y_true_test", y_true)
+    save_prediction_array(output_dir, "Y_pred_final", y_pred)
+    if y_prob is not None:
+        np.save(output_dir / "Y_prob_test.npy", y_prob)
     np.savetxt(
         output_dir / "TaHiP_node_metrics.txt",
         np.column_stack([np.arange(n), metric_matrix]),
@@ -432,12 +506,13 @@ def main():
         output_dir / "TaHiP_pearson_matrix.txt", pearson_matrix,
         fmt="%.8f", header="rows/cols: HD PHD HOH HOP", comments="",
     )
-    np.savetxt(
-        output_dir / "infection_condition_metrics.txt", infection_groups,
-        fmt=["%d", "%d", "%.8f", "%.8f"],
-        header="active_edges count actual_infection_rate mean_predicted_infection_prob",
-        comments="",
-    )
+    if infection_groups is not None:
+        np.savetxt(
+            output_dir / "infection_condition_metrics.txt", infection_groups,
+            fmt=["%d", "%d", "%.8f", "%.8f"],
+            header="active_edges count actual_infection_rate mean_predicted_infection_prob",
+            comments="",
+        )
     (output_dir / "structure_threshold_metrics.txt").write_text(
         "\n".join(structure_lines) + "\n", encoding="utf-8"
     )
@@ -453,9 +528,9 @@ def main():
     best_checkpoint["Pearson"] = pearson
     torch.save(best_checkpoint, checkpoint_path)
 
-    print(f"\nBest epoch: {best_checkpoint['best_epoch']}; val_CE={best_val_ce:.8f}")
+    print(f"\nBest epoch: {best_checkpoint['best_epoch']}; val_{loss_name}={best_val_ce:.8f}")
     print("\n[Test dynamics | sampled target rows]")
-    print("MSE/MAE use state codes: 0=S, 1=I, 2=R.")
+    print(f"MSE/MAE use saved state encoding: {spec['state_encoding']}")
     for name, value in test_metrics.items():
         print(f"{name:26s} = {value:.8f}")
     print("\n[Undirected triplet reconstruction | Top-E / 0.5 / 0.1]")
@@ -478,13 +553,14 @@ def main():
         print(f"{name:8s} = {value:.6f}")
     print("\nPearson matrix order: HD PHD HOH HOP")
     print(pearson_matrix)
-    print_sir_infection_groups(infection_groups)
+    if infection_groups is not None:
+        print_sir_infection_groups(infection_groups)
     print(f"\nSaved results: {output_dir.resolve()}")
 
     # 恢复最佳权重后记录一次；保留对比用数值，并用文本汇总最终结果。
     final_metrics = {
         "best_epoch": best_checkpoint["best_epoch"],
-        "best/val_CE": best_val_ce,
+        f"best/val_{loss_name}": best_val_ce,
         **{f"best/test/sampled_rows/{name}": value for name, value in test_metrics.items()},
         **{f"best/structure/{name}": value for name, value in structure["edge_metrics"].items()},
         "best/structure/Triplet_view_disagreement": structure["row_metrics"]["Direction_disagreement"],
@@ -499,6 +575,7 @@ def main():
     summary_lines = [
         f"Network: {args.network_name}",
         f"Dynamics: {args.dynamics_name}",
+        "Training mode: joint",
         f"Best epoch: {best_checkpoint['best_epoch']}",
     ]
     summary_sections = {}
